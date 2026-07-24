@@ -1,6 +1,8 @@
 package render
 
 import (
+	"sync"
+
 	"github.com/tachyne/tachyne-world/worldread"
 )
 
@@ -14,11 +16,14 @@ type Mesher struct {
 	atlas  *Atlas
 	cm     *Colormaps
 
+	// Caches shared across concurrent MeshChunk calls (the pod meshes tiles in
+	// parallel); guarded by mu. Values are computed OUTSIDE the lock so meshing
+	// stays parallel — the lock only protects map access.
+	mu         sync.Mutex
 	bsCache    map[string]*RawBlockState // block name -> blockstate (nil = none)
 	modelCache map[string]*Model         // model loc -> resolved model
 	quadCache  map[uint32][]quadTemplate // state id -> baked quads
 	occCache   map[uint32]bool           // state id -> occludes a neighbour face
-	nameCache  map[uint32]string         // state id -> block name
 }
 
 // NewMesher builds a mesher over the given assets, atlas, and colormaps.
@@ -31,7 +36,6 @@ func NewMesher(assets *Assets, atlas *Atlas, cm *Colormaps) *Mesher {
 		modelCache: map[string]*Model{},
 		quadCache:  map[uint32][]quadTemplate{},
 		occCache:   map[uint32]bool{},
-		nameCache:  map[uint32]string{},
 	}
 }
 
@@ -125,17 +129,21 @@ func (m *Mesher) MeshChunk(r *worldread.Reader, cx, cz int) *Tile {
 
 // stateQuads returns (and caches) the baked face quads for a block state.
 func (m *Mesher) stateQuads(state uint32) []quadTemplate {
-	if q, ok := m.quadCache[state]; ok {
+	m.mu.Lock()
+	q, ok := m.quadCache[state]
+	m.mu.Unlock()
+	if ok {
 		return q
 	}
-	q := m.buildStateQuads(state)
+	q = m.buildStateQuads(state) // outside the lock; sub-caches lock independently
+	m.mu.Lock()
 	m.quadCache[state] = q
+	m.mu.Unlock()
 	return q
 }
 
 func (m *Mesher) buildStateQuads(state uint32) []quadTemplate {
 	name, props := worldread.Decode(state)
-	m.nameCache[state] = name
 	if name == "minecraft:air" {
 		return nil
 	}
@@ -249,11 +257,15 @@ func (m *Mesher) occludes(state uint32) bool {
 	if state == 0 {
 		return false
 	}
-	if v, ok := m.occCache[state]; ok {
+	m.mu.Lock()
+	v, ok := m.occCache[state]
+	m.mu.Unlock()
+	if ok {
 		return v
 	}
+	// Computed outside the lock; blockState/model lock independently.
 	name, props := worldread.Decode(state)
-	v := false
+	v = false
 	if isFluid(name) {
 		v = true
 	} else if opaqueName(name) {
@@ -266,33 +278,45 @@ func (m *Mesher) occludes(state uint32) bool {
 			}
 		}
 	}
+	m.mu.Lock()
 	m.occCache[state] = v
+	m.mu.Unlock()
 	return v
 }
 
 // blockState fetches and caches a block's blockstate JSON (nil if none).
 func (m *Mesher) blockState(name string) *RawBlockState {
-	if bs, ok := m.bsCache[name]; ok {
+	m.mu.Lock()
+	bs, ok := m.bsCache[name]
+	m.mu.Unlock()
+	if ok {
 		return bs
 	}
 	bs, err := m.assets.BlockState(name)
 	if err != nil {
 		bs = nil
 	}
+	m.mu.Lock()
 	m.bsCache[name] = bs
+	m.mu.Unlock()
 	return bs
 }
 
 // model resolves and caches a model by location (nil on failure).
 func (m *Mesher) model(loc string) *Model {
-	if mo, ok := m.modelCache[loc]; ok {
+	m.mu.Lock()
+	mo, ok := m.modelCache[loc]
+	m.mu.Unlock()
+	if ok {
 		return mo
 	}
 	mo, err := Resolve(m.assets, loc)
 	if err != nil {
 		mo = nil
 	}
+	m.mu.Lock()
 	m.modelCache[loc] = mo
+	m.mu.Unlock()
 	return mo
 }
 
