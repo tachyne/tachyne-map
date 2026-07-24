@@ -39,6 +39,16 @@ go test ./...              # unit tests (no network)
 go run ./cmd/jarcheck -v   # validate the loader against the real client jar
 ```
 
+## Acknowledgements
+
+tachyne-map is inspired by [BlueMap](https://bluemap.bluecolored.de) by Blue
+(BlueColored) — the excellent 3D Minecraft web map that set the bar for what a
+browser-based world view can be, and which tachyne used (via its Java renderer)
+before this. tachyne-map is an independent, from-scratch Go implementation
+rather than a port, but the concept is BlueMap's. BlueMap is open source under
+the MIT license; if any BlueMap-derived code lands here, it will be credited in
+a `NOTICE` file per that license.
+
 ## License
 
 Licensed under Apache-2.0 — see [LICENSE](LICENSE).
