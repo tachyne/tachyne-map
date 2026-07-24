@@ -77,8 +77,10 @@ func main() {
 		atlasPNG: atlasBuf.Bytes(),
 		cache:    map[[2]int]*render.Tile{},
 		dim:      reader.Dim().String(),
+		live:     newLiveHub(),
 	}
 	srv.manifest = srv.buildManifest(*cx, *cz, *radius)
+	go srv.runFlusher()
 
 	sub, err := fs.Sub(webFS, "web")
 	if err != nil {
@@ -88,6 +90,7 @@ func main() {
 	mux.HandleFunc("/manifest.json", srv.handleManifest)
 	mux.HandleFunc("/atlas.png", srv.handleAtlas)
 	mux.HandleFunc("/tile/", srv.handleTile)
+	mux.HandleFunc("/events", srv.handleEvents)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 
@@ -105,14 +108,22 @@ type server struct {
 	manifest []byte
 	dim      string
 
+	live *liveHub // tile invalidation + SSE fan-out
+
 	mu    sync.Mutex
 	cache map[[2]int]*render.Tile
 	order [][2]int // insertion order, for bounded eviction
 }
 
 // maxCachedTiles bounds the meshed-tile cache so the streaming viewer panning
-// across the world can't grow pod memory without limit (re-meshing is cheap).
-const maxCachedTiles = 1500
+// across the world can't grow pod memory without limit (re-meshing is ~15ms).
+//
+// Sized deliberately small: a tile is ~0.5 MB of geometry, and the pod ALSO
+// carries the world's own byte-budgeted caches (generated chunks ~256 MB +
+// light). At 1500 this cache alone was ~750 MB and panning into fresh terrain
+// — which grows all three at once — OOM-killed the pod. The viewer keeps its
+// own resident ring (~289 tiles), so this only needs to cover revisits.
+const maxCachedTiles = 256
 
 // buildManifest advertises the served region: the tile grid plus spawn/atlas
 // metadata the viewer needs.
