@@ -42,6 +42,8 @@ func main() {
 	cz := flag.Int("cz", envInt("MAP_CZ", 0), "center chunk Z")
 	natsURL := flag.String("nats", envOr("NATS_URL", ""),
 		"NATS URL of the engine bus (empty = no live updates; seed comes from -seed)")
+	worldFile := flag.String("world", envOr("MAP_WORLD", ""),
+		"path to the engine's world.gob, read-only, to show existing player builds (empty = terrain only)")
 	flag.Parse()
 
 	log.Printf("tachyne-map: provisioning %s assets into %s", *version, *cacheDir)
@@ -80,9 +82,23 @@ func main() {
 		}
 	}
 
-	reader, err := worldread.Open(worldread.Overworld, worldSeed, nil)
-	if err != nil {
-		log.Fatalf("open world: %v", err)
+	// With a world file the map also shows everything players have BUILT (the
+	// engine's edit overlay), not just generated terrain. It is opened
+	// read-only and never saved — see worldread's SetBlock/Save contract — so
+	// the engine remains the only writer.
+	var reader *worldread.Reader
+	if *worldFile != "" {
+		reader, err = worldread.OpenGob(worldread.Overworld, worldSeed, *worldFile)
+		if err != nil {
+			log.Fatalf("open world %s: %v", *worldFile, err)
+		}
+		log.Printf("world: loaded player edits from %s", *worldFile)
+	} else {
+		reader, err = worldread.Open(worldread.Overworld, worldSeed, nil)
+		if err != nil {
+			log.Fatalf("open world: %v", err)
+		}
+		log.Printf("world: terrain only (no -world file; player builds will not show)")
 	}
 
 	var atlasBuf bytes.Buffer
@@ -97,6 +113,7 @@ func main() {
 		cache:    map[[2]int]*render.Tile{},
 		dim:      reader.Dim().String(),
 		live:     newLiveHub(),
+		players:  newPlayerTracker(),
 	}
 	srv.manifest = srv.buildManifest(*cx, *cz, *radius)
 	go srv.runFlusher()
@@ -107,6 +124,7 @@ func main() {
 		} else {
 			log.Printf("bus: following block changes — the map updates live")
 		}
+		go srv.players.runPlayerPoll(bus)
 	}
 
 	sub, err := fs.Sub(webFS, "web")
@@ -118,6 +136,8 @@ func main() {
 	mux.HandleFunc("/atlas.png", srv.handleAtlas)
 	mux.HandleFunc("/tile/", srv.handleTile)
 	mux.HandleFunc("/events", srv.handleEvents)
+	mux.HandleFunc("/players.json", srv.handlePlayers)
+	mux.HandleFunc("/mobs.json", srv.handleMobs)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 
@@ -135,7 +155,8 @@ type server struct {
 	manifest []byte
 	dim      string
 
-	live *liveHub // tile invalidation + SSE fan-out
+	live    *liveHub       // tile invalidation + SSE fan-out
+	players *playerTracker // latest player positions for map markers
 
 	// worldVersion increments on every applied block change. A tile that was
 	// already being meshed when an edit landed must not be cached afterwards —

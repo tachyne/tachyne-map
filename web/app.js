@@ -24,6 +24,10 @@
 //                                           An EMPTY tile (no indices) is valid:
 //                                           "loaded, nothing to draw". A 404 is
 //                                           treated the same way, not an error.
+//   GET players.json                     -> { players: [{ eid, name, x, y, z, … }] }
+//                                           full snapshot of online players,
+//                                           polled every second (absent/404 is
+//                                           fine: no markers)
 //
 // Tile schema notes:
 //   positions — world-space floats, 3 per vertex
@@ -44,16 +48,19 @@ import { OrbitControls } from './vendor/OrbitControls.js';
 
 // Chunks within this Chebyshev radius of the focus chunk are kept loaded:
 // a (2R+1)^2 square, so 8 -> up to 17x17 = 289 resident tiles.
-const LOAD_RADIUS = 8;
+const LOAD_RADIUS = 12;
 // Tiles are only unloaded beyond LOAD_RADIUS + UNLOAD_MARGIN, so a tile at
-// the boundary doesn't thrash load/unload as the focus jitters.
-const UNLOAD_MARGIN = 2;
+// the boundary doesn't thrash load/unload as the focus jitters — and so a
+// tile you just looked at is still there when you pan back.
+const UNLOAD_MARGIN = 4;
 // Max tile fetches in flight at once.
 const TILE_FETCH_CONCURRENCY = 8;
 // Debounce for OrbitControls 'change' -> desired-set recompute (ms).
 const STREAM_DEBOUNCE_MS = 150;
 // Safety-net recompute interval (ms) in case a change event is missed.
 const STREAM_INTERVAL_MS = 500;
+// Poll interval for live player positions (ms).
+const PLAYER_POLL_MS = 1000;
 const SKY_COLOR = 0x87ceeb; // light sky blue
 
 // Data base path. Default '' = same place the page is served from.
@@ -86,6 +93,7 @@ function updateHUD() {
     `tiles  ${stats.resident} resident, ${stats.inFlight} in flight\n` +
     `chunk  ${fx}, ${fz}\n` +
     `height ${camera.position.y.toFixed(1)}\n` +
+    `players ${playerMarkers.size}\n` +
     `streaming r=${LOAD_RADIUS}${live ? ' · live' : ''}`;
 }
 
@@ -108,7 +116,10 @@ const camera = new THREE.PerspectiveCamera(
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.1;
-controls.maxDistance = 2000;
+// Keep the camera inside the streamed region: zooming out past the loaded
+// ring is what makes the world look like it's disappearing at the edges.
+// LOAD_RADIUS chunks * 16 blocks, with margin for the viewing angle.
+controls.maxDistance = LOAD_RADIUS * 16 * 1.6;
 
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -118,6 +129,7 @@ window.addEventListener('resize', () => {
 
 renderer.setAnimationLoop(() => {
   controls.update();
+  updatePlayerMarkers(); // ease markers toward their latest polled position
   updateHUD();
   renderer.render(scene, camera);
 });
@@ -343,6 +355,189 @@ function scheduleLiveRefresh() {
 }
 
 // ---------------------------------------------------------------------------
+// Player markers
+// ---------------------------------------------------------------------------
+
+// Live player positions are polled, not pushed: GET players.json returns a
+// FULL snapshot { players: [{ eid, name, x, y, z, dim, gamemode, health }] }
+// each time — an eid missing from the snapshot has left (or changed
+// dimension) and its marker is removed. Coordinates are absolute world
+// coords, the same space as tile geometry.
+//
+// Each player gets a small scene-level group (independent of tiles, so tile
+// unloading never touches it): a colored octahedron at the player position
+// plus a name label rendered as a Sprite. The label texture is a canvas drawn
+// ONCE per player (cached; only rebuilt on a rename) — white text on a dark
+// pill. Labels use sizeAttenuation:false (constant screen size at any
+// distance) and both parts draw with depthTest:false + a high renderOrder, so
+// a player inside a cave is still findable through the terrain.
+
+// How far above the player position the name label is anchored (world units).
+const LABEL_LIFT = 2.2;
+// Label screen height with sizeAttenuation:false — clip-space-ish units where
+// ~0.05 is a few percent of the viewport height.
+const LABEL_SCALE = 0.055;
+// Per-frame lerp factor easing a marker toward its latest polled position.
+const MARKER_LERP = 0.2;
+
+// eid -> { group, target, name, labelTexture, labelMaterial, dotMaterial }.
+const playerMarkers = new Map();
+
+// One geometry shared by every position dot; never disposed per-marker.
+const dotGeometry = new THREE.OctahedronGeometry(0.5);
+
+// True while a players.json fetch is in flight — a slow response must not
+// stack a second request behind it.
+let playersInFlight = false;
+
+// Deterministic per-player dot color: golden-angle hue walk over the eid.
+function playerColor(eid) {
+  return new THREE.Color().setHSL(((eid * 137.508) % 360) / 360, 0.85, 0.55);
+}
+
+// Draw a name once into a canvas: white text on a rounded dark pill.
+function makeLabelTexture(name) {
+  const font = 'bold 28px system-ui, sans-serif';
+  const pad = 12, radius = 10;
+  const canvas = document.createElement('canvas');
+  let ctx = canvas.getContext('2d');
+  ctx.font = font;
+  canvas.width = Math.ceil(ctx.measureText(name).width) + pad * 2;
+  canvas.height = 28 + pad * 2;
+  ctx = canvas.getContext('2d'); // resizing reset the context state
+
+  // Pill background (hand-rolled rounded rect; half-pixel inset keeps the
+  // 1px stroke crisp).
+  const x = 0.5, y = 0.5, w = canvas.width - 1, h = canvas.height - 1;
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);
+  ctx.arcTo(x + w, y, x + w, y + h, radius);
+  ctx.arcTo(x + w, y + h, x, y + h, radius);
+  ctx.arcTo(x, y + h, x, y, radius);
+  ctx.arcTo(x, y, x + w, y, radius);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
+  ctx.stroke();
+
+  ctx.font = font;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#fff';
+  ctx.fillText(name, canvas.width / 2, canvas.height / 2 + 1);
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.minFilter = THREE.LinearFilter; // odd-sized canvas: no mipmaps
+  tex.generateMipmaps = false;
+  return tex;
+}
+
+// Keep the label's canvas aspect ratio at a constant screen height.
+function scaleLabel(label, texture) {
+  const { width, height } = texture.image;
+  label.scale.set(LABEL_SCALE * (width / height), LABEL_SCALE, 1);
+}
+
+function addPlayerMarker(p) {
+  const group = new THREE.Group();
+  group.position.set(p.x, p.y, p.z); // snap on spawn; lerp only on updates
+
+  const dotMaterial = new THREE.MeshBasicMaterial({
+    color: playerColor(p.eid),
+    depthTest: false, // visible through terrain
+  });
+  const dot = new THREE.Mesh(dotGeometry, dotMaterial);
+  dot.renderOrder = 999; // after all tiles (depthTest is off)
+
+  const name = p.name ?? `eid ${p.eid}`;
+  const labelTexture = makeLabelTexture(name);
+  const labelMaterial = new THREE.SpriteMaterial({
+    map: labelTexture,
+    sizeAttenuation: false, // constant screen size at any distance
+    depthTest: false,
+    transparent: true,
+  });
+  const label = new THREE.Sprite(labelMaterial);
+  scaleLabel(label, labelTexture);
+  label.position.y = LABEL_LIFT;
+  label.center.set(0.5, 0); // anchor bottom-center: pill grows upward on screen
+  label.renderOrder = 1000; // labels above dots
+
+  group.add(dot, label);
+  scene.add(group);
+  playerMarkers.set(p.eid, {
+    group,
+    target: new THREE.Vector3(p.x, p.y, p.z),
+    name,
+    labelTexture,
+    labelMaterial,
+    dotMaterial,
+  });
+}
+
+// Drop a marker and free everything it owns (the shared dotGeometry stays).
+function removePlayerMarker(eid, m) {
+  scene.remove(m.group);
+  m.labelMaterial.dispose();
+  m.labelTexture.dispose();
+  m.dotMaterial.dispose();
+  playerMarkers.delete(eid);
+}
+
+// Reconcile markers against a snapshot: move/add present eids, remove absent.
+function applyPlayers(players) {
+  const seen = new Set();
+  for (const p of players) {
+    if (p == null || typeof p.eid !== 'number' ||
+        !Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.z)) {
+      continue; // malformed entry — skip, never throw
+    }
+    seen.add(p.eid);
+    const m = playerMarkers.get(p.eid);
+    if (!m) { addPlayerMarker(p); continue; }
+    m.target.set(p.x, p.y, p.z); // render loop lerps toward this
+    const name = p.name ?? `eid ${p.eid}`;
+    if (name !== m.name) { // rename: rebuild the cached label once
+      m.labelTexture.dispose();
+      m.labelTexture = makeLabelTexture(name);
+      m.labelMaterial.map = m.labelTexture;
+      scaleLabel(m.group.children[1], m.labelTexture);
+      m.name = name;
+    }
+  }
+  for (const [eid, m] of playerMarkers) {
+    if (!seen.has(eid)) removePlayerMarker(eid, m);
+  }
+}
+
+async function pollPlayers() {
+  if (playersInFlight) return;
+  playersInFlight = true;
+  try {
+    const res = await fetch(dataURL('players.json'));
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = await res.json();
+    // players may be [], null, or absent — all mean "nobody online".
+    applyPlayers(Array.isArray(body?.players) ? body.players : []);
+  } catch (err) {
+    // Endpoint absent (old pod, testdata) or transient failure — stay quiet;
+    // the next tick simply tries again.
+    console.debug('players.json skipped:', err.message ?? err);
+  }
+  playersInFlight = false;
+}
+
+// Per-frame easing toward the latest polled positions (called from the
+// animation loop; snapping every second would look jumpy).
+function updatePlayerMarkers() {
+  for (const m of playerMarkers.values()) {
+    m.group.position.lerp(m.target, MARKER_LERP);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -379,6 +574,10 @@ async function main() {
 
   // Follow world edits so builds appear without a reload.
   connectLiveUpdates();
+
+  // Follow players: poll the position snapshot once a second.
+  pollPlayers();
+  setInterval(pollPlayers, PLAYER_POLL_MS);
 }
 
 main().catch((err) => {

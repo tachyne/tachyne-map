@@ -64,6 +64,22 @@ Any integer `cx,cz` may be requested. An **empty** tile (no indices) is a
 valid answer meaning "nothing to draw here"; a **404** is treated the same
 way. Both are cached as loaded-empty and never retried while resident.
 
+### `GET /players.json`
+
+```json
+{
+  "players": [
+    { "eid": 123, "name": "EdgeZA", "x": 12.5, "y": 68.0, "z": -40.2,
+      "dim": 0, "gamemode": 0, "health": 20.0 }
+  ]
+}
+```
+
+Full snapshot of online players (absolute world coords, same space as tile
+geometry) — not a delta: an eid missing from the snapshot has left or changed
+dimension. `players` may be `[]`, `null`, or absent; a 404 (older pod,
+testdata) is fine — all mean "no markers". See **Player markers** below.
+
 Contract points the renderer depends on:
 
 - **V from the top**: the atlas texture is uploaded with `flipY = false`, so
@@ -105,9 +121,25 @@ out of range are discarded immediately. No coord is ever fetched twice while
 tracked.
 
 HUD (top-left) shows resident tile count, in-flight fetch count, the focus
-chunk, camera height, and the streaming radius; a top-center banner shows
-startup progress and errors. Mouse: left-drag orbits, right-drag pans, wheel
-zooms (OrbitControls with damping).
+chunk, camera height, the online player count, and the streaming radius; a
+top-center banner shows startup progress and errors. Mouse: left-drag orbits,
+right-drag pans, wheel zooms (OrbitControls with damping).
+
+## Player markers
+
+The viewer polls `players.json` every **1000 ms** (one request at a time — a
+slow response never stacks a second one) and reconciles a marker per `eid`:
+a colored octahedron at the player position plus a name label — white text on
+a dark pill, drawn into a canvas **once** per player and cached (rebuilt only
+on a rename). Labels use `sizeAttenuation: false` (constant screen size at
+any distance) and both parts render with `depthTest: false` at a high
+`renderOrder`, so a player underground is still findable through the terrain.
+Markers ease toward the latest polled position with a per-frame lerp instead
+of snapping once a second; new eids appear (snapped, no fly-in), absent eids
+are removed with their texture/materials disposed (the octahedron geometry is
+shared and kept). Markers live directly in the scene — tile unloading never
+touches them. A failed or 404 fetch is logged at debug level and retried on
+the next tick.
 
 ## Local development (no server)
 
