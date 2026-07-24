@@ -80,6 +80,25 @@ geometry) — not a delta: an eid missing from the snapshot has left or changed
 dimension. `players` may be `[]`, `null`, or absent; a 404 (older pod,
 testdata) is fine — all mean "no markers". See **Player markers** below.
 
+### `GET /mobs.json`
+
+```json
+{
+  "mobs": [
+    { "eid": 51, "type": "cow", "x": 12.5, "y": 68.0, "z": -40.2,
+      "health": 10, "max_health": 10, "category": "passive" }
+  ]
+}
+```
+
+Full snapshot of live mobs (same coordinate space), polled every **2000 ms**.
+`type` is a bare name (`cow`, `zombie` — no `minecraft:` prefix);
+`category` is `"hostile"`, `"passive"`, or `"other"` (unknown values render
+as "other"). Like players, this is not a delta — an eid missing from the
+snapshot is gone. `mobs` may be `[]`, `null`, or absent, and a 404 is fine —
+all mean "no markers". There can be hundreds of mobs, which is why they
+render very differently from players; see **Mob markers** below.
+
 Contract points the renderer depends on:
 
 - **V from the top**: the atlas texture is uploaded with `flipY = false`, so
@@ -121,9 +140,10 @@ out of range are discarded immediately. No coord is ever fetched twice while
 tracked.
 
 HUD (top-left) shows resident tile count, in-flight fetch count, the focus
-chunk, camera height, the online player count, and the streaming radius; a
-top-center banner shows startup progress and errors. Mouse: left-drag orbits,
-right-drag pans, wheel zooms (OrbitControls with damping).
+chunk, camera height, the online player count, the rendered mob count, and
+the streaming radius; a top-center banner shows startup progress and errors.
+Mouse: left-drag orbits, right-drag pans, wheel zooms (OrbitControls with
+damping). Keyboard: **`m`** toggles mob markers on/off.
 
 ## Player markers
 
@@ -140,6 +160,33 @@ are removed with their texture/materials disposed (the octahedron geometry is
 shared and kept). Markers live directly in the scene — tile unloading never
 touches them. A failed or 404 fetch is logged at debug level and retried on
 the next tick.
+
+## Mob markers
+
+The viewer polls `mobs.json` every **2000 ms** (again one request at a time).
+Mobs can number in the hundreds, so the per-player Group + canvas-label
+design is deliberately NOT reused: each category is one
+**`THREE.InstancedMesh`** — a shared small octahedron geometry with a flat
+`MeshBasicMaterial` color — so the entire mob population costs at most three
+draw calls and carries **no name labels**. Colors: hostile `#e0483a` (red),
+passive `#5fbf5f` (green), other `#d9c25a` (muted yellow; also the fallback
+for unknown categories).
+
+Each mesh is allocated at `max(256, next power of two ≥ count)` instances and
+rebuilt only when a snapshot exceeds that capacity (the old instance buffers
+are disposed; the shared geometry/material are kept). `mesh.count` is set to
+the live number every poll, so shrinking populations leave no stale
+instances. Mobs farther than `LOAD_RADIUS * 16 * 2` blocks (horizontal) from
+the focus point are culled at poll time. Positions ease toward the latest
+polled target with the same per-frame lerp as players — a few hundred
+instance-matrix writes per frame is cheap. Mobs draw with
+`depthTest: false` at a `renderOrder` *below* the player markers, so players
+always stay on top.
+
+Pressing **`m`** hides/shows all mob markers (the HUD notes when they are
+hidden); polling continues while hidden so re-showing is instant and
+current. A failed or 404 fetch (older pod, testdata) is logged at debug
+level and retried on the next tick.
 
 ## Local development (no server)
 

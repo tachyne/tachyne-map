@@ -28,6 +28,12 @@
 //                                           full snapshot of online players,
 //                                           polled every second (absent/404 is
 //                                           fine: no markers)
+//   GET mobs.json                        -> { mobs: [{ eid, type, x, y, z,
+//                                           health, max_health, category }] }
+//                                           full snapshot of live mobs,
+//                                           polled every 2 s (absent/404 is
+//                                           fine: no markers); category is
+//                                           "hostile" | "passive" | "other"
 //
 // Tile schema notes:
 //   positions — world-space floats, 3 per vertex
@@ -48,7 +54,7 @@ import { OrbitControls } from './vendor/OrbitControls.js';
 
 // Chunks within this Chebyshev radius of the focus chunk are kept loaded:
 // a (2R+1)^2 square, so 8 -> up to 17x17 = 289 resident tiles.
-const LOAD_RADIUS = 12;
+const LOAD_RADIUS = 20;
 // Tiles are only unloaded beyond LOAD_RADIUS + UNLOAD_MARGIN, so a tile at
 // the boundary doesn't thrash load/unload as the focus jitters — and so a
 // tile you just looked at is still there when you pan back.
@@ -61,6 +67,8 @@ const STREAM_DEBOUNCE_MS = 150;
 const STREAM_INTERVAL_MS = 500;
 // Poll interval for live player positions (ms).
 const PLAYER_POLL_MS = 1000;
+// Poll interval for live mob positions (ms) — mobs are many, so poll slower.
+const MOB_POLL_MS = 2000;
 const SKY_COLOR = 0x87ceeb; // light sky blue
 
 // Data base path. Default '' = same place the page is served from.
@@ -94,6 +102,7 @@ function updateHUD() {
     `chunk  ${fx}, ${fz}\n` +
     `height ${camera.position.y.toFixed(1)}\n` +
     `players ${playerMarkers.size}\n` +
+    `mobs   ${mobCount}${mobsVisible ? '' : ' (hidden — m)'}\n` +
     `streaming r=${LOAD_RADIUS}${live ? ' · live' : ''}`;
 }
 
@@ -108,7 +117,10 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(SKY_COLOR);
 // Light fog fading into the sky color hides the loading horizon.
-scene.fog = new THREE.Fog(SKY_COLOR, 300, 1800);
+// Fade to sky BEFORE the streamed region ends, so the edge of what's loaded is
+// never a visible cut — distance haze instead of a hole. Derived from
+// LOAD_RADIUS so the two can't drift apart.
+scene.fog = new THREE.Fog(SKY_COLOR, LOAD_RADIUS * 16 * 0.55, LOAD_RADIUS * 16 * 0.95);
 
 const camera = new THREE.PerspectiveCamera(
   70, window.innerWidth / window.innerHeight, 0.1, 4000);
@@ -119,7 +131,7 @@ controls.dampingFactor = 0.1;
 // Keep the camera inside the streamed region: zooming out past the loaded
 // ring is what makes the world look like it's disappearing at the edges.
 // LOAD_RADIUS chunks * 16 blocks, with margin for the viewing angle.
-controls.maxDistance = LOAD_RADIUS * 16 * 1.6;
+controls.maxDistance = LOAD_RADIUS * 16 * 1.2;
 
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -130,6 +142,7 @@ window.addEventListener('resize', () => {
 renderer.setAnimationLoop(() => {
   controls.update();
   updatePlayerMarkers(); // ease markers toward their latest polled position
+  updateMobMarkers();    // same easing, batched through instance matrices
   updateHUD();
   renderer.render(scene, camera);
 });
@@ -538,6 +551,197 @@ function updatePlayerMarkers() {
 }
 
 // ---------------------------------------------------------------------------
+// Mob markers
+// ---------------------------------------------------------------------------
+
+// Live mob positions come from GET mobs.json — a FULL snapshot
+// { mobs: [{ eid, type, x, y, z, health, max_health, category }] } polled
+// every MOB_POLL_MS. Unlike players there can be hundreds of mobs, so the
+// per-player Group + canvas-label design would drown the renderer in draw
+// calls and texture uploads. Instead each category ("hostile" | "passive" |
+// "other") is ONE THREE.InstancedMesh sharing a small octahedron geometry and
+// a flat-color material: the whole mob population is at most three draw
+// calls, and a poll only rewrites instance matrices. No name labels — that is
+// exactly the per-mob cost this design exists to avoid.
+//
+// Capacity: each mesh is allocated at max(256, next power of two >= count)
+// instances and only rebuilt (dispose + new InstancedMesh) when a snapshot
+// exceeds it; `count` is set to the live number each poll so unused
+// instances are never drawn and shrinking snapshots leave no stale ghosts.
+//
+// Motion: positions ease toward the latest polled target with the same
+// per-frame lerp as players — a few hundred Matrix4 translations per frame is
+// far cheaper than the draw calls they feed, and snapping every 2 s looks
+// terrible for things that walk constantly.
+//
+// Mobs draw with depthTest:false (findable through terrain, like players) at
+// renderOrder BELOW the player dot/label, so players always stay on top.
+
+// Mobs farther than this from the focus point (horizontal distance) are not
+// rendered — keeps instance counts sane on a busy world. Matches roughly
+// twice the streamed-terrain radius.
+const MOB_VIEW_DIST = LOAD_RADIUS * 16 * 2;
+// Minimum instance capacity per category mesh.
+const MOB_MIN_CAPACITY = 256;
+// Below the player dot (999) and label (1000): players draw on top of mobs.
+const MOB_RENDER_ORDER = 998;
+
+// Small shared geometry for every mob instance (smaller than the player dot).
+const mobGeometry = new THREE.OctahedronGeometry(0.4);
+
+// One layer (material + growable InstancedMesh + this poll's entries) per
+// category. An unknown category falls back to "other".
+const mobLayers = {
+  hostile: makeMobLayer(0xe0483a), // red
+  passive: makeMobLayer(0x5fbf5f), // green
+  other: makeMobLayer(0xd9c25a),   // muted yellow
+};
+
+// eid -> { cur: Vector3, target: Vector3 }, kept across polls so easing has
+// continuity; eids absent from a snapshot are forgotten.
+const mobStates = new Map();
+
+let mobCount = 0;        // rendered mobs (post-cull), for the HUD
+let mobsVisible = true;  // 'm' toggles
+let mobsInFlight = false;
+const mobMatrix = new THREE.Matrix4(); // scratch, reused for every write
+
+function makeMobLayer(color) {
+  return {
+    material: new THREE.MeshBasicMaterial({ color, depthTest: false }),
+    mesh: null,     // created lazily / rebuilt on capacity growth
+    capacity: 0,
+    entries: [],    // mobStates refs for this category, rebuilt each poll
+  };
+}
+
+// Grow a layer's InstancedMesh to hold at least n instances. Rebuild is rare
+// (only when a snapshot exceeds the current power-of-two capacity); the old
+// mesh's instance buffers are disposed, the shared geometry/material are not.
+function ensureMobCapacity(layer, n) {
+  if (n <= layer.capacity) return;
+  let cap = Math.max(MOB_MIN_CAPACITY, layer.capacity);
+  while (cap < n) cap *= 2;
+
+  if (layer.mesh) {
+    scene.remove(layer.mesh);
+    layer.mesh.dispose(); // frees instanceMatrix GPU buffer only
+  }
+  const mesh = new THREE.InstancedMesh(mobGeometry, layer.material, cap);
+  mesh.count = 0; // no stale instances drawn before the first matrix write
+  mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  mesh.renderOrder = MOB_RENDER_ORDER;
+  mesh.frustumCulled = false; // instance positions aren't in the geometry bounds
+  mesh.visible = mobsVisible;
+  scene.add(mesh);
+  layer.mesh = mesh;
+  layer.capacity = cap;
+}
+
+// Reconcile against a snapshot: bucket near-focus mobs into their category
+// layer, update easing targets, drop absent eids, and rewrite each layer's
+// matrices/count so the draw state is correct even before the next frame.
+function applyMobs(mobs) {
+  const maxDistSq = MOB_VIEW_DIST * MOB_VIEW_DIST;
+  const seen = new Set();
+  for (const layer of Object.values(mobLayers)) layer.entries.length = 0;
+
+  for (const mob of mobs) {
+    if (mob == null || typeof mob.eid !== 'number' ||
+        !Number.isFinite(mob.x) || !Number.isFinite(mob.y) || !Number.isFinite(mob.z)) {
+      continue; // malformed entry — skip, never throw
+    }
+    // Horizontal distance cull around the focus point.
+    const dx = mob.x - controls.target.x;
+    const dz = mob.z - controls.target.z;
+    if (dx * dx + dz * dz > maxDistSq) continue;
+
+    seen.add(mob.eid);
+    let s = mobStates.get(mob.eid);
+    if (!s) { // new mob: snap, no fly-in
+      s = {
+        cur: new THREE.Vector3(mob.x, mob.y, mob.z),
+        target: new THREE.Vector3(mob.x, mob.y, mob.z),
+      };
+      mobStates.set(mob.eid, s);
+    } else {
+      s.target.set(mob.x, mob.y, mob.z);
+      // While hidden the per-frame lerp is skipped; snap so a later toggle
+      // shows current positions instead of easing across stale distance.
+      if (!mobsVisible) s.cur.copy(s.target);
+    }
+    (mobLayers[mob.category] ?? mobLayers.other).entries.push(s);
+  }
+
+  // Forget mobs absent from the snapshot (died, despawned, or culled away).
+  for (const eid of mobStates.keys()) {
+    if (!seen.has(eid)) mobStates.delete(eid);
+  }
+  mobCount = seen.size;
+
+  // Write matrices immediately: a freshly grown mesh must never draw its
+  // count with unset (identity) matrices for a frame, and a shrunken count
+  // must take effect now, not at the next frame.
+  for (const layer of Object.values(mobLayers)) {
+    ensureMobCapacity(layer, layer.entries.length);
+    const mesh = layer.mesh;
+    if (!mesh) continue; // category never had mobs yet
+    mesh.count = layer.entries.length;
+    for (let i = 0; i < layer.entries.length; i++) {
+      const s = layer.entries[i];
+      mesh.setMatrixAt(i, mobMatrix.makeTranslation(s.cur.x, s.cur.y, s.cur.z));
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+  }
+}
+
+async function pollMobs() {
+  if (mobsInFlight) return; // a slow response must not stack a second request
+  mobsInFlight = true;
+  try {
+    const res = await fetch(dataURL('mobs.json'));
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = await res.json();
+    // mobs may be [], null, or absent — all mean "no mobs".
+    applyMobs(Array.isArray(body?.mobs) ? body.mobs : []);
+  } catch (err) {
+    // Endpoint absent (old pod, testdata) or transient failure — stay quiet;
+    // the next tick simply tries again.
+    console.debug('mobs.json skipped:', err.message ?? err);
+  }
+  mobsInFlight = false;
+}
+
+// Per-frame easing pass: lerp every visible mob toward its latest polled
+// position and rewrite its instance matrix. A few hundred translations per
+// frame is cheap; skipped entirely while hidden.
+function updateMobMarkers() {
+  if (!mobsVisible) return;
+  for (const layer of Object.values(mobLayers)) {
+    const mesh = layer.mesh;
+    if (!mesh || layer.entries.length === 0) continue;
+    for (let i = 0; i < layer.entries.length; i++) {
+      const s = layer.entries[i];
+      s.cur.lerp(s.target, MARKER_LERP);
+      mesh.setMatrixAt(i, mobMatrix.makeTranslation(s.cur.x, s.cur.y, s.cur.z));
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+  }
+}
+
+// 'm' shows/hides mob markers (plain keypress only — modifier combos like
+// Ctrl+M stay with the browser).
+window.addEventListener('keydown', (e) => {
+  if ((e.key === 'm' || e.key === 'M') &&
+      !e.ctrlKey && !e.metaKey && !e.altKey) {
+    mobsVisible = !mobsVisible;
+    for (const layer of Object.values(mobLayers)) {
+      if (layer.mesh) layer.mesh.visible = mobsVisible;
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -578,6 +782,10 @@ async function main() {
   // Follow players: poll the position snapshot once a second.
   pollPlayers();
   setInterval(pollPlayers, PLAYER_POLL_MS);
+
+  // Follow mobs: slower poll, instanced rendering (see Mob markers above).
+  pollMobs();
+  setInterval(pollMobs, MOB_POLL_MS);
 }
 
 main().catch((err) => {

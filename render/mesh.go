@@ -1,6 +1,7 @@
 package render
 
 import (
+	"math"
 	"sync"
 
 	"github.com/tachyne/tachyne-world/worldread"
@@ -15,6 +16,14 @@ type Mesher struct {
 	assets *Assets
 	atlas  *Atlas
 	cm     *Colormaps
+
+	// SurfaceDepth, when > 0, skips blocks buried more than this many blocks
+	// below their own column's surface. A map is viewed from above, so cave
+	// walls and deep strata are invisible yet dominate a chunk's geometry —
+	// dropping them shrinks tiles dramatically, which is what lets the viewer
+	// keep a much larger area resident. Per-column, so cliffs, overhangs and
+	// valley floors (whose own column tops are low) are unaffected.
+	SurfaceDepth int
 
 	// Caches shared across concurrent MeshChunk calls (the pod meshes tiles in
 	// parallel); guarded by mu. Values are computed OUTSIDE the lock so meshing
@@ -75,7 +84,16 @@ func (m *Mesher) MeshChunk(r *worldread.Reader, cx, cz int) *Tile {
 	for lx := 0; lx < 16; lx++ {
 		for lz := 0; lz < 16; lz++ {
 			wx, wz := cx*16+lx, cz*16+lz
+			// Everything below this world-Y is buried under its own column
+			// and never visible from above.
+			floorY := math.MinInt32
+			if m.SurfaceDepth > 0 {
+				floorY = int(center.Heightmap[lz*16+lx]) - m.SurfaceDepth
+			}
 			for ly := 0; ly < height; ly++ {
+				if worldread.MinY+ly < floorY {
+					continue
+				}
 				state := center.State(lx, ly, lz)
 				if state == 0 {
 					continue

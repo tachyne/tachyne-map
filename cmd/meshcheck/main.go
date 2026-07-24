@@ -32,6 +32,7 @@ func main() {
 	radius := flag.Int("radius", 4, "chunk radius to mesh around center")
 	out := flag.String("out", "", "if set, write viewer data (atlas+manifest+tiles) here")
 	png := flag.String("png", "", "if set, write a top-down flat-shaded preview PNG here")
+	surfaceDepth := flag.Int("surface-depth", 0, "skip geometry buried more than N blocks below its column surface (0 = keep everything)")
 	flag.Parse()
 
 	jar, err := render.EnsureClientJar(*cache, *version, true)
@@ -52,6 +53,7 @@ func main() {
 		log.Fatalf("colormaps: %v", err)
 	}
 	mesher := render.NewMesher(a, atlas, cm)
+	mesher.SurfaceDepth = *surfaceDepth
 
 	r, err := worldread.Open(worldread.Overworld, *seed, nil) // terrain only
 	if err != nil {

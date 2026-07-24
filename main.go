@@ -44,6 +44,8 @@ func main() {
 		"NATS URL of the engine bus (empty = no live updates; seed comes from -seed)")
 	worldFile := flag.String("world", envOr("MAP_WORLD", ""),
 		"path to the engine's world.gob, read-only, to show existing player builds (empty = terrain only)")
+	surfaceDepth := flag.Int("surface-depth", envInt("MAP_SURFACE_DEPTH", 24),
+		"skip geometry buried more than N blocks below its column surface (0 = keep caves; costs ~3.6x the geometry)")
 	flag.Parse()
 
 	log.Printf("tachyne-map: provisioning %s assets into %s", *version, *cacheDir)
@@ -66,6 +68,7 @@ func main() {
 		log.Fatalf("colormaps: %v", err)
 	}
 	mesher := render.NewMesher(assets, atlas, cm)
+	mesher.SurfaceDepth = *surfaceDepth
 
 	// Connect the bus first: the engine is the source of truth for the seed, so
 	// asking it beats duplicating the value as pod config. A bus failure is not
