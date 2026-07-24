@@ -1,0 +1,7 @@
+# local asset cache (client jar + extracted vanilla assets — never vendored)
+/.cache/
+*.jar
+
+# build output
+/tachyne-map
+/bin/
