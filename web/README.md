@@ -2,11 +2,13 @@
 
 A self-contained browser 3D viewer for pre-meshed world tiles. The Go pod
 serves this directory as static files plus the data endpoints below; the
-viewer fetches the manifest, the texture atlas, and every listed tile, and
-renders one `THREE.BufferGeometry` mesh per tile. All lighting and biome tint
-is baked into per-vertex colors by the server-side mesher, so the scene has no
-lights — a single unlit material multiplies the atlas texture by the baked
-vertex color.
+viewer fetches the manifest and the texture atlas once, then **streams tiles
+around the camera** (Google-Maps style) — only chunks near the view focus are
+resident, and distant ones are unloaded, so the user can pan across the world
+indefinitely with bounded memory. Each tile renders as one
+`THREE.BufferGeometry` mesh. All lighting and biome tint is baked into
+per-vertex colors by the server-side mesher, so the scene has no lights — a
+single unlit material multiplies the atlas texture by the baked vertex color.
 
 ## Files
 
@@ -33,10 +35,13 @@ transparently.
   "name": "world name",
   "dim": "overworld",
   "spawn": [x, y, z],          // floats, world coords
-  "atlasCell": 16,             // px per atlas cell
-  "tiles": [[cx, cz], ...]     // every available tile
+  "atlasCell": 16              // px per atlas cell
 }
 ```
+
+A `tiles` list, if present, is **ignored**: the viewer computes which chunk
+coords it wants from the camera position and asks for them directly — the pod
+meshes any chunk on demand.
 
 ### `GET /atlas.png`
 
@@ -55,6 +60,10 @@ is 528×528 = 33×33 cells). Sampled with nearest filtering, no mipmaps.
 }
 ```
 
+Any integer `cx,cz` may be requested. An **empty** tile (no indices) is a
+valid answer meaning "nothing to draw here"; a **404** is treated the same
+way. Both are cached as loaded-empty and never retried while resident.
+
 Contract points the renderer depends on:
 
 - **V from the top**: the atlas texture is uploaded with `flipY = false`, so
@@ -68,18 +77,37 @@ Contract points the renderer depends on:
 - **`alphaTest: 0.5`**: cutout transparency (foliage etc.) works; smooth alpha
   does not — bake translucency some other way if it's ever needed.
 
-## Load flow
+## Streaming
 
 1. `GET manifest.json` → camera is placed above/behind `spawn`, looking at it.
 2. `GET atlas.png` → `NearestFilter` mag+min, `generateMipmaps = false`,
    `flipY = false`, sRGB color space.
-3. All tiles in the manifest are fetched **nearest-to-spawn first**, at most 8
-   in flight, and added to the scene as they arrive. A failed tile is logged
-   and counted in the HUD; it never aborts the rest.
+3. From then on the viewer streams: the **focus point** is the OrbitControls
+   orbit/pan target; its chunk (`floor(x/16), floor(z/16)`) is the focus
+   chunk. Every chunk within `LOAD_RADIUS` (Chebyshev) of the focus is
+   fetched **nearest-to-focus first**, at most `TILE_FETCH_CONCURRENCY` in
+   flight, and added to the scene as it arrives. Chunks that drift beyond
+   `LOAD_RADIUS + UNLOAD_MARGIN` are removed and their geometry disposed
+   (the shared material/atlas are kept). The desired set is recomputed on
+   camera movement (debounced ~150 ms) plus a 500 ms safety-net interval.
 
-HUD (top-left) shows loaded/total tile count and camera coordinates; a
-top-center banner shows load progress and errors. Mouse: left-drag orbits,
-right-drag pans, wheel zooms (OrbitControls with damping).
+Knobs (consts at the top of `app.js`):
+
+| Const | Default | Meaning |
+|---|---|---|
+| `LOAD_RADIUS` | 8 | Keep chunks within this radius of the focus chunk — a 17×17 square, ≤289 resident tiles. |
+| `UNLOAD_MARGIN` | 2 | Only unload beyond `LOAD_RADIUS + UNLOAD_MARGIN`, so boundary tiles don't thrash. |
+| `TILE_FETCH_CONCURRENCY` | 8 | Max tile fetches in flight. |
+
+Failed fetches and 404s are cached as loaded-empty (logged at debug level,
+never retried while resident); results that arrive after the focus has moved
+out of range are discarded immediately. No coord is ever fetched twice while
+tracked.
+
+HUD (top-left) shows resident tile count, in-flight fetch count, the focus
+chunk, camera height, and the streaming radius; a top-center banner shows
+startup progress and errors. Mouse: left-drag orbits, right-drag pans, wheel
+zooms (OrbitControls with damping).
 
 ## Local development (no server)
 

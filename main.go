@@ -107,7 +107,12 @@ type server struct {
 
 	mu    sync.Mutex
 	cache map[[2]int]*render.Tile
+	order [][2]int // insertion order, for bounded eviction
 }
+
+// maxCachedTiles bounds the meshed-tile cache so the streaming viewer panning
+// across the world can't grow pod memory without limit (re-meshing is cheap).
+const maxCachedTiles = 1500
 
 // buildManifest advertises the served region: the tile grid plus spawn/atlas
 // metadata the viewer needs.
@@ -185,7 +190,17 @@ func (s *server) tile(cx, cz int) *render.Tile {
 	t := s.mesher.MeshChunk(s.reader, cx, cz)
 
 	s.mu.Lock()
-	s.cache[key] = t
+	if _, ok := s.cache[key]; !ok {
+		s.cache[key] = t
+		s.order = append(s.order, key)
+		if len(s.order) > maxCachedTiles {
+			n := maxCachedTiles / 5 // evict the oldest fifth
+			for _, k := range s.order[:n] {
+				delete(s.cache, k)
+			}
+			s.order = append(s.order[:0], s.order[n:]...)
+		}
+	}
 	s.mu.Unlock()
 	return t
 }

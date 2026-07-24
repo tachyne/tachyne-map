@@ -1,4 +1,4 @@
-// tachyne-map browser viewer
+// tachyne-map browser viewer — viewport streaming
 //
 // Fetches a manifest + pre-meshed tile geometry from the tachyne-map pod and
 // renders it with three.js. All lighting/tint is baked into per-vertex colors
@@ -6,10 +6,24 @@
 // MeshBasicMaterial with vertexColors multiplies the atlas texture by the
 // baked color.
 //
+// Instead of loading a fixed tile list, the viewer STREAMS tiles around the
+// camera (Google-Maps style): the OrbitControls target is the focus point;
+// every chunk within LOAD_RADIUS of the focus chunk is fetched (nearest
+// first, throttled), and chunks that drift outside LOAD_RADIUS + UNLOAD_MARGIN
+// are removed and their geometry disposed. Memory stays bounded at roughly
+// (2*LOAD_RADIUS+1)^2 resident tiles no matter how far the user pans.
+//
 // Server contract (all paths relative to the data base, default the page root):
-//   GET manifest.json                    -> { name, dim, spawn:[x,y,z], atlasCell, tiles:[[cx,cz],...] }
+//   GET manifest.json                    -> { name, dim, spawn:[x,y,z], atlasCell }
+//                                           (manifest.tiles is IGNORED — the
+//                                           viewer computes which chunks to ask
+//                                           for; the pod meshes any chunk on
+//                                           demand)
 //   GET atlas.png                        -> block-texture atlas, grid of atlasCell-px cells
 //   GET tile/{dim}/{cx}/{cz}.json        -> { dim, cx, cz, positions[], uvs[], colors[], indices[] }
+//                                           An EMPTY tile (no indices) is valid:
+//                                           "loaded, nothing to draw". A 404 is
+//                                           treated the same way, not an error.
 //
 // Tile schema notes:
 //   positions — world-space floats, 3 per vertex
@@ -28,7 +42,18 @@ import { OrbitControls } from './vendor/OrbitControls.js';
 // Config
 // ---------------------------------------------------------------------------
 
+// Chunks within this Chebyshev radius of the focus chunk are kept loaded:
+// a (2R+1)^2 square, so 8 -> up to 17x17 = 289 resident tiles.
+const LOAD_RADIUS = 8;
+// Tiles are only unloaded beyond LOAD_RADIUS + UNLOAD_MARGIN, so a tile at
+// the boundary doesn't thrash load/unload as the focus jitters.
+const UNLOAD_MARGIN = 2;
+// Max tile fetches in flight at once.
 const TILE_FETCH_CONCURRENCY = 8;
+// Debounce for OrbitControls 'change' -> desired-set recompute (ms).
+const STREAM_DEBOUNCE_MS = 150;
+// Safety-net recompute interval (ms) in case a change event is missed.
+const STREAM_INTERVAL_MS = 500;
 const SKY_COLOR = 0x87ceeb; // light sky blue
 
 // Data base path. Default '' = same place the page is served from.
@@ -45,13 +70,6 @@ const canvas = document.getElementById('view');
 const hudEl = document.getElementById('hud');
 const statusEl = document.getElementById('status');
 
-const hud = {
-  tilesLoaded: 0,
-  tilesTotal: 0,
-  tilesFailed: 0,
-  loading: true,
-};
-
 function setStatus(text, isError = false) {
   statusEl.textContent = text;
   statusEl.classList.toggle('error', isError);
@@ -63,11 +81,12 @@ function hideStatus() {
 }
 
 function updateHUD() {
-  const p = camera.position;
-  const failed = hud.tilesFailed ? `  (${hud.tilesFailed} failed)` : '';
+  const [fx, fz] = focusChunk();
   hudEl.textContent =
-    `tiles  ${hud.tilesLoaded}/${hud.tilesTotal}${failed}\n` +
-    `camera ${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}`;
+    `tiles  ${stats.resident} resident, ${stats.inFlight} in flight\n` +
+    `chunk  ${fx}, ${fz}\n` +
+    `height ${camera.position.y.toFixed(1)}\n` +
+    `streaming r=${LOAD_RADIUS}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -124,7 +143,7 @@ function loadAtlas(url) {
 }
 
 // ---------------------------------------------------------------------------
-// Tile loading
+// Tile mesh building
 // ---------------------------------------------------------------------------
 
 // Build one BufferGeometry mesh from a Tile JSON payload.
@@ -160,18 +179,125 @@ async function fetchTile(dim, cx, cz) {
   return res.json(); // gzip on the wire is transparent to fetch()
 }
 
-// Run fn over items with at most `limit` in flight at once.
-async function forEachLimited(items, limit, fn) {
-  let next = 0;
-  const worker = async () => {
-    while (next < items.length) {
-      const item = items[next++];
-      await fn(item);
-    }
-  };
-  const n = Math.min(limit, items.length);
-  await Promise.all(Array.from({ length: n }, worker));
+// ---------------------------------------------------------------------------
+// Streaming state
+// ---------------------------------------------------------------------------
+
+const LOADING = 'loading'; // sentinel state while a fetch is in flight
+
+// "cx,cz" -> LOADING | THREE.Mesh (drawn) | null (loaded, empty/404).
+// A key's presence means "don't fetch this coord again" — until it is
+// unloaded for being out of range.
+const tiles = new Map();
+
+// Desired-but-not-yet-loading coords, sorted nearest-to-focus first.
+// Rebuilt wholesale on every recompute, so stale entries simply vanish.
+let pendingQueue = [];
+
+const stats = { resident: 0, inFlight: 0 };
+
+// Set once the manifest + atlas are in; streaming is a no-op before that.
+let streaming = null; // { dim, material }
+
+const tileKey = (cx, cz) => `${cx},${cz}`;
+
+// The focus point is the OrbitControls orbit/pan target (on the ground);
+// world coords -> chunk coords at 16 blocks per chunk.
+function focusChunk() {
+  return [Math.floor(controls.target.x / 16), Math.floor(controls.target.z / 16)];
 }
+
+// Recompute the desired set around the focus chunk: queue loads for missing
+// coords, unload coords beyond the margin. Cheap (~O(radius^2 + resident)),
+// safe to call often.
+function updateStreaming() {
+  if (!streaming) return;
+  const [fx, fz] = focusChunk();
+
+  // Unload: anything resident beyond LOAD_RADIUS + UNLOAD_MARGIN (Chebyshev).
+  // In-flight fetches are left alone; their completion handler re-checks
+  // range and discards out-of-range results itself.
+  for (const [key, state] of tiles) {
+    if (state === LOADING) continue;
+    const [cx, cz] = key.split(',').map(Number);
+    if (Math.max(Math.abs(cx - fx), Math.abs(cz - fz)) > LOAD_RADIUS + UNLOAD_MARGIN) {
+      unloadTile(key, state);
+    }
+  }
+
+  // Load: every coord within LOAD_RADIUS not already tracked, nearest first.
+  pendingQueue = [];
+  for (let dz = -LOAD_RADIUS; dz <= LOAD_RADIUS; dz++) {
+    for (let dx = -LOAD_RADIUS; dx <= LOAD_RADIUS; dx++) {
+      const cx = fx + dx, cz = fz + dz;
+      if (!tiles.has(tileKey(cx, cz))) {
+        pendingQueue.push([cx, cz, dx * dx + dz * dz]);
+      }
+    }
+  }
+  pendingQueue.sort((a, b) => a[2] - b[2]);
+  pumpQueue();
+}
+
+// Remove a resident tile: drop the mesh from the scene and free its GPU
+// geometry. The shared material and atlas texture are NOT disposed.
+function unloadTile(key, state) {
+  if (state instanceof THREE.Mesh) {
+    scene.remove(state);
+    state.geometry.dispose();
+  }
+  tiles.delete(key);
+  stats.resident--;
+}
+
+// Start fetches from the pending queue up to the concurrency cap.
+function pumpQueue() {
+  while (stats.inFlight < TILE_FETCH_CONCURRENCY && pendingQueue.length > 0) {
+    const [cx, cz] = pendingQueue.shift();
+    const key = tileKey(cx, cz);
+    if (tiles.has(key)) continue; // already loading/loaded via an older queue
+    tiles.set(key, LOADING);
+    stats.inFlight++;
+    loadTile(cx, cz, key); // async; completion pumps again
+  }
+}
+
+async function loadTile(cx, cz, key) {
+  let mesh = null; // null = loaded-empty (no geometry, or fetch failed)
+  try {
+    const tile = await fetchTile(streaming.dim, cx, cz);
+    if (tile.indices && tile.indices.length > 0) {
+      mesh = buildTileMesh(tile, streaming.material);
+    }
+  } catch (err) {
+    // 404s (unmeshed/out-of-world chunks) and transient errors are expected
+    // while panning — record the coord as loaded-empty so it isn't retried
+    // every tick, and keep the noise at debug level.
+    console.debug(`tile ${cx},${cz} skipped:`, err.message ?? err);
+  }
+  stats.inFlight--;
+
+  // The focus may have moved while this fetch was in flight; drop results
+  // that are already out of keep-range instead of parking them resident.
+  const [fx, fz] = focusChunk();
+  if (Math.max(Math.abs(cx - fx), Math.abs(cz - fz)) > LOAD_RADIUS + UNLOAD_MARGIN) {
+    if (mesh) mesh.geometry.dispose();
+    tiles.delete(key);
+  } else {
+    if (mesh) scene.add(mesh);
+    tiles.set(key, mesh);
+    stats.resident++;
+  }
+  pumpQueue();
+}
+
+// Debounced recompute on camera movement + a periodic safety net.
+let streamDebounce = 0;
+controls.addEventListener('change', () => {
+  clearTimeout(streamDebounce);
+  streamDebounce = setTimeout(updateStreaming, STREAM_DEBOUNCE_MS);
+});
+setInterval(updateStreaming, STREAM_INTERVAL_MS);
 
 // ---------------------------------------------------------------------------
 // Main
@@ -201,35 +327,12 @@ async function main() {
     alphaTest: 0.5,         // cutout foliage/glass; no sorting needed
   });
 
-  // Sort tiles nearest-to-spawn first so the area around the camera pops in
-  // before the fringes.
-  const tiles = [...manifest.tiles].sort((a, b) => {
-    const da = (a[0] * 16 + 8 - sx) ** 2 + (a[1] * 16 + 8 - sz) ** 2;
-    const db = (b[0] * 16 + 8 - sx) ** 2 + (b[1] * 16 + 8 - sz) ** 2;
-    return da - db;
-  });
-
-  hud.tilesTotal = tiles.length;
-  setStatus(`loading tiles… 0/${tiles.length}`);
-
-  await forEachLimited(tiles, TILE_FETCH_CONCURRENCY, async ([cx, cz]) => {
-    try {
-      const tile = await fetchTile(manifest.dim, cx, cz);
-      scene.add(buildTileMesh(tile, material));
-      hud.tilesLoaded++;
-    } catch (err) {
-      hud.tilesFailed++;
-      console.error(err);
-    }
-    setStatus(`loading tiles… ${hud.tilesLoaded + hud.tilesFailed}/${tiles.length}`);
-  });
-
-  hud.loading = false;
-  if (hud.tilesFailed > 0) {
-    setStatus(`loaded with ${hud.tilesFailed} failed tile(s) — see console`, true);
-  } else {
-    hideStatus();
-  }
+  // Everything is ready — start streaming tiles around the focus point.
+  // From here on, tiles load and unload as the camera moves; there is no
+  // fixed tile list and no "done loading" moment.
+  streaming = { dim: manifest.dim, material };
+  hideStatus();
+  updateStreaming();
 }
 
 main().catch((err) => {
