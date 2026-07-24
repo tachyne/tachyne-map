@@ -39,9 +39,9 @@ go test ./...              # unit tests (no network)
 go run ./cmd/jarcheck -v   # validate the loader against the real client jar
 ```
 
-## Credits & license
+## License
 
-Written by Wesley Channon. Licensed under Apache-2.0 — see [LICENSE](LICENSE).
+Licensed under Apache-2.0 — see [LICENSE](LICENSE).
 
 tachyne is an **unofficial fan project** — not affiliated with, endorsed by, or
 associated with Mojang, Microsoft, or the developers of Minecraft. "Minecraft"
