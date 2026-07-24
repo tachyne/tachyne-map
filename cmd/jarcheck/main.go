@@ -22,6 +22,7 @@ func main() {
 	version := flag.String("version", "1.21.11", "Minecraft version to validate against")
 	cache := flag.String("cache", defaultCache(), "asset cache dir")
 	verbose := flag.Bool("v", false, "list sample failures")
+	atlasOut := flag.String("atlas", "", "if set, build the block atlas and write it to this PNG path")
 	flag.Parse()
 
 	jar, err := render.EnsureClientJar(*cache, *version, true)
@@ -117,6 +118,38 @@ func main() {
 
 	if len(parseFail)+len(missingModel)+len(unresolved)+len(missingTex) == 0 {
 		fmt.Printf("\nALL CLEAN ✅\n")
+	}
+
+	// Colormaps + atlas: exercise the M2 asset stitching against real textures.
+	fmt.Printf("\n== atlas / colormaps ==\n")
+	if cm, err := render.LoadColormaps(a); err != nil {
+		fmt.Printf("colormaps: FAILED: %v\n", err)
+	} else {
+		g := cm.Grass(0.8, 0.4) // plains-ish
+		f := cm.Foliage(0.8, 0.4)
+		fmt.Printf("colormaps loaded; grass(0.8,0.4)=#%02X%02X%02X foliage(0.8,0.4)=#%02X%02X%02X\n",
+			g.R, g.G, g.B, f.R, f.G, f.B)
+	}
+
+	locs, _ := render.ReferencedBlockTextures(a)
+	fmt.Printf("referenced block textures: %d\n", len(locs))
+	at := render.BuildAtlas(a, locs, 16)
+	fmt.Printf("atlas: %d sprites, image %dx%d px\n",
+		len(at.Sprites), at.Img.Bounds().Dx(), at.Img.Bounds().Dy())
+	for _, l := range []string{"minecraft:block/stone", "minecraft:block/grass_block_top", "minecraft:block/oak_planks"} {
+		s := at.Lookup(l)
+		fmt.Printf("  %-34s uv [%.4f,%.4f]-[%.4f,%.4f]\n", l, s.U0, s.V0, s.U1, s.V1)
+	}
+	if *atlasOut != "" {
+		f, err := os.Create(*atlasOut)
+		if err != nil {
+			log.Fatalf("create atlas png: %v", err)
+		}
+		if err := at.EncodePNG(f); err != nil {
+			log.Fatalf("encode atlas: %v", err)
+		}
+		f.Close()
+		fmt.Printf("wrote atlas -> %s\n", *atlasOut)
 	}
 }
 
