@@ -20,8 +20,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/tachyne/tachyne-map/render"
+	"github.com/tachyne/tachyne-world/busplugin"
 	"github.com/tachyne/tachyne-world/worldread"
 )
 
@@ -38,6 +40,8 @@ func main() {
 	radius := flag.Int("radius", envInt("MAP_RADIUS", 8), "chunk radius served around the center")
 	cx := flag.Int("cx", envInt("MAP_CX", 0), "center chunk X")
 	cz := flag.Int("cz", envInt("MAP_CZ", 0), "center chunk Z")
+	natsURL := flag.String("nats", envOr("NATS_URL", ""),
+		"NATS URL of the engine bus (empty = no live updates; seed comes from -seed)")
 	flag.Parse()
 
 	log.Printf("tachyne-map: provisioning %s assets into %s", *version, *cacheDir)
@@ -61,7 +65,22 @@ func main() {
 	}
 	mesher := render.NewMesher(assets, atlas, cm)
 
-	reader, err := worldread.Open(worldread.Overworld, *seed, nil) // terrain only (edits: M4)
+	// Connect the bus first: the engine is the source of truth for the seed, so
+	// asking it beats duplicating the value as pod config. A bus failure is not
+	// fatal — the map falls back to -seed and simply serves a static world.
+	var bus *busplugin.Conn
+	worldSeed := *seed
+	if *natsURL != "" {
+		bus, err = busplugin.Connect(*natsURL)
+		if err != nil {
+			log.Printf("bus: connect %s failed (%v) — no live updates", *natsURL, err)
+		} else if info := discoverWorld(bus); info != nil {
+			worldSeed = info.Seed
+			log.Printf("bus: engine reports seed %d (%d sections)", info.Seed, info.Sections)
+		}
+	}
+
+	reader, err := worldread.Open(worldread.Overworld, worldSeed, nil)
 	if err != nil {
 		log.Fatalf("open world: %v", err)
 	}
@@ -82,6 +101,14 @@ func main() {
 	srv.manifest = srv.buildManifest(*cx, *cz, *radius)
 	go srv.runFlusher()
 
+	if bus != nil {
+		if err := srv.followBlockChanges(bus); err != nil {
+			log.Printf("bus: block_change subscribe failed (%v) — no live updates", err)
+		} else {
+			log.Printf("bus: following block changes — the map updates live")
+		}
+	}
+
 	sub, err := fs.Sub(webFS, "web")
 	if err != nil {
 		log.Fatalf("web fs: %v", err)
@@ -95,7 +122,7 @@ func main() {
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 
 	log.Printf("tachyne-map: serving %s on %s (seed %d, region ±%d chunks around %d,%d)",
-		srv.dim, *addr, *seed, *radius, *cx, *cz)
+		srv.dim, *addr, worldSeed, *radius, *cx, *cz)
 	if err := http.ListenAndServe(*addr, mux); err != nil {
 		log.Fatal(err)
 	}
@@ -109,6 +136,12 @@ type server struct {
 	dim      string
 
 	live *liveHub // tile invalidation + SSE fan-out
+
+	// worldVersion increments on every applied block change. A tile that was
+	// already being meshed when an edit landed must not be cached afterwards —
+	// the invalidation would have swept the cache before the stale mesh
+	// arrived, leaving it stuck until the next edit.
+	worldVersion atomic.Uint64
 
 	mu    sync.Mutex
 	cache map[[2]int]*render.Tile
@@ -198,7 +231,11 @@ func (s *server) tile(cx, cz int) *render.Tile {
 	}
 	s.mu.Unlock()
 
+	ver := s.worldVersion.Load()
 	t := s.mesher.MeshChunk(s.reader, cx, cz)
+	if s.worldVersion.Load() != ver {
+		return t // the world changed while meshing: serve it, don't cache it
+	}
 
 	s.mu.Lock()
 	if _, ok := s.cache[key]; !ok {

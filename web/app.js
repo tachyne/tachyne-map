@@ -86,7 +86,7 @@ function updateHUD() {
     `tiles  ${stats.resident} resident, ${stats.inFlight} in flight\n` +
     `chunk  ${fx}, ${fz}\n` +
     `height ${camera.position.y.toFixed(1)}\n` +
-    `streaming r=${LOAD_RADIUS}`;
+    `streaming r=${LOAD_RADIUS}${live ? ' · live' : ''}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +199,9 @@ const stats = { resident: 0, inFlight: 0 };
 // Set once the manifest + atlas are in; streaming is a no-op before that.
 let streaming = null; // { dim, material }
 
+// True while the live-update event stream is connected.
+let live = false;
+
 const tileKey = (cx, cz) => `${cx},${cz}`;
 
 // The focus point is the OrbitControls orbit/pan target (on the ground);
@@ -300,6 +303,46 @@ controls.addEventListener('change', () => {
 setInterval(updateStreaming, STREAM_INTERVAL_MS);
 
 // ---------------------------------------------------------------------------
+// Live updates
+// ---------------------------------------------------------------------------
+
+// The pod pushes tile invalidations over Server-Sent Events whenever the world
+// changes, so builds appear on the map seconds after they are placed.
+// EventSource reconnects on its own, so a pod restart or a dropped connection
+// heals with no retry logic here.
+function connectLiveUpdates() {
+  const es = new EventSource(dataURL('events'));
+  es.addEventListener('tile', (e) => {
+    try {
+      const { cx, cz } = JSON.parse(e.data);
+      invalidateTile(cx, cz);
+    } catch (err) {
+      console.debug('live: bad tile event', err);
+    }
+  });
+  es.addEventListener('open', () => { live = true; });
+  es.onerror = () => { live = false; }; // EventSource retries on its own
+  return es;
+}
+
+// Forget a tile so the next streaming pass re-fetches it with fresh geometry.
+function invalidateTile(cx, cz) {
+  const key = tileKey(cx, cz);
+  const state = tiles.get(key);
+  if (state === undefined) return; // not resident — nothing to refresh
+  if (state === LOADING) return;   // in flight; it will pick up the change
+  unloadTile(key, state);
+  scheduleLiveRefresh();
+}
+
+// One edit dirties a 3x3 of tiles, so coalesce a burst into a single recompute.
+let liveDebounce = 0;
+function scheduleLiveRefresh() {
+  clearTimeout(liveDebounce);
+  liveDebounce = setTimeout(updateStreaming, 100);
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -333,6 +376,9 @@ async function main() {
   streaming = { dim: manifest.dim, material };
   hideStatus();
   updateStreaming();
+
+  // Follow world edits so builds appear without a reload.
+  connectLiveUpdates();
 }
 
 main().catch((err) => {
