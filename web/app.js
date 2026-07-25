@@ -71,6 +71,18 @@ const PLAYER_POLL_MS = 1000;
 const MOB_POLL_MS = 2000;
 const SKY_COLOR = 0x87ceeb; // light sky blue
 
+// The four toggleable marker layers, in panel order. Each colour is the single
+// source of truth for BOTH the marker material and its legend swatch, so the
+// panel can never claim a colour the map doesn't draw. Players are drawn in a
+// per-player colour, so their legend glyph uses a neutral white.
+const LAYER_KEYS = ['players', 'hostile', 'passive', 'other'];
+const LAYER_COLORS = {
+  players: 0xffffff, // legend only; actual dots use playerColor(eid)
+  hostile: 0xe0483a, // red
+  passive: 0x5fbf5f, // green
+  other: 0xd9c25a,   // muted yellow
+};
+
 // Data base path. Default '' = same place the page is served from.
 // ?data=testdata (or an absolute URL) redirects all data fetches.
 const dataBase = (new URLSearchParams(location.search).get('data') ?? '')
@@ -95,6 +107,60 @@ function hideStatus() {
   statusEl.classList.add('hidden');
 }
 
+// ---------------------------------------------------------------------------
+// Marker layer toggles
+// ---------------------------------------------------------------------------
+
+// Which marker layers are drawn. Hiding a layer is not merely cosmetic: the
+// per-frame easing pass skips hidden layers entirely, so a hidden layer costs
+// nothing per frame beyond its (still running) poll.
+const layerVisible = Object.fromEntries(LAYER_KEYS.map((k) => [k, true]));
+
+// key -> { button, countEl }, populated once at startup.
+const layerControls = new Map();
+
+function initLayerPanel() {
+  for (const button of document.querySelectorAll('#layers button[data-layer]')) {
+    const key = button.dataset.layer;
+    if (!(key in layerVisible)) continue; // markup/JS drift — ignore, don't throw
+    button.style.setProperty('--layer-color',
+      `#${LAYER_COLORS[key].toString(16).padStart(6, '0')}`);
+    button.addEventListener('click', () => setLayerVisible(key, !layerVisible[key]));
+    layerControls.set(key, { button, countEl: button.querySelector('.count') });
+  }
+  refreshLayerPanel();
+}
+
+function setLayerVisible(key, on) {
+  if (layerVisible[key] === on) return;
+  layerVisible[key] = on;
+  applyLayerVisibility(key);
+  refreshLayerPanel();
+}
+
+// Push a layer's visibility onto the scene objects it owns.
+function applyLayerVisibility(key) {
+  const visible = layerVisible[key];
+  if (key === 'players') {
+    for (const m of playerMarkers.values()) m.group.visible = visible;
+    return;
+  }
+  const layer = mobLayers[key];
+  if (layer?.mesh) layer.mesh.visible = visible;
+}
+
+// Reflect current state + counts in the panel. Cheap; called on every poll.
+function refreshLayerPanel() {
+  for (const [key, { button, countEl }] of layerControls) {
+    button.setAttribute('aria-pressed', String(layerVisible[key]));
+    const n = key === 'players'
+      ? playerMarkers.size
+      : (mobLayers[key]?.entries.length ?? 0);
+    const text = String(n);
+    if (countEl.textContent !== text) countEl.textContent = text;
+  }
+}
+
 function updateHUD() {
   const [fx, fz] = focusChunk();
   hudEl.textContent =
@@ -102,7 +168,7 @@ function updateHUD() {
     `chunk  ${fx}, ${fz}\n` +
     `height ${camera.position.y.toFixed(1)}\n` +
     `players ${playerMarkers.size}\n` +
-    `mobs   ${mobCount}${mobsVisible ? '' : ' (hidden — m)'}\n` +
+    `mobs   ${mobCount}\n` +
     `streaming r=${LOAD_RADIUS}${live ? ' · live' : ''}`;
 }
 
@@ -466,6 +532,7 @@ function scaleLabel(label, texture) {
 function addPlayerMarker(p) {
   const group = new THREE.Group();
   group.position.set(p.x, p.y, p.z); // snap on spawn; lerp only on updates
+  group.visible = layerVisible.players; // a marker added while hidden stays hidden
 
   const dotMaterial = new THREE.MeshBasicMaterial({
     color: playerColor(p.eid),
@@ -533,6 +600,7 @@ function applyPlayers(players) {
   for (const [eid, m] of playerMarkers) {
     if (!seen.has(eid)) removePlayerMarker(eid, m);
   }
+  refreshLayerPanel();
 }
 
 async function pollPlayers() {
@@ -602,9 +670,9 @@ const mobGeometry = new THREE.OctahedronGeometry(0.4);
 // One layer (material + growable InstancedMesh + this poll's entries) per
 // category. An unknown category falls back to "other".
 const mobLayers = {
-  hostile: makeMobLayer(0xe0483a), // red
-  passive: makeMobLayer(0x5fbf5f), // green
-  other: makeMobLayer(0xd9c25a),   // muted yellow
+  hostile: makeMobLayer('hostile'),
+  passive: makeMobLayer('passive'),
+  other: makeMobLayer('other'),
 };
 
 // eid -> { cur: Vector3, target: Vector3 }, kept across polls so easing has
@@ -612,13 +680,13 @@ const mobLayers = {
 const mobStates = new Map();
 
 let mobCount = 0;        // rendered mobs (post-cull), for the HUD
-let mobsVisible = true;  // 'm' toggles
 let mobsInFlight = false;
 const mobMatrix = new THREE.Matrix4(); // scratch, reused for every write
 
-function makeMobLayer(color) {
+function makeMobLayer(key) {
   return {
-    material: new THREE.MeshBasicMaterial({ color, depthTest: false }),
+    key,            // matches the data-layer key on the toggle button
+    material: new THREE.MeshBasicMaterial({ color: LAYER_COLORS[key], depthTest: false }),
     mesh: null,     // created lazily / rebuilt on capacity growth
     capacity: 0,
     entries: [],    // mobStates refs for this category, rebuilt each poll
@@ -642,7 +710,7 @@ function ensureMobCapacity(layer, n) {
   mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
   mesh.renderOrder = MOB_RENDER_ORDER;
   mesh.frustumCulled = false; // instance positions aren't in the geometry bounds
-  mesh.visible = mobsVisible;
+  mesh.visible = layerVisible[layer.key];
   scene.add(mesh);
   layer.mesh = mesh;
   layer.capacity = cap;
@@ -667,6 +735,9 @@ function applyMobs(mobs) {
     if (dx * dx + dz * dz > maxDistSq) continue;
 
     seen.add(mob.eid);
+    // Resolve the category layer up front: the hidden-snap below needs to know
+    // which layer's visibility applies.
+    const layer = mobLayers[mob.category] ?? mobLayers.other;
     let s = mobStates.get(mob.eid);
     if (!s) { // new mob: snap, no fly-in
       s = {
@@ -678,9 +749,9 @@ function applyMobs(mobs) {
       s.target.set(mob.x, mob.y, mob.z);
       // While hidden the per-frame lerp is skipped; snap so a later toggle
       // shows current positions instead of easing across stale distance.
-      if (!mobsVisible) s.cur.copy(s.target);
+      if (!layerVisible[layer.key]) s.cur.copy(s.target);
     }
-    (mobLayers[mob.category] ?? mobLayers.other).entries.push(s);
+    layer.entries.push(s);
   }
 
   // Forget mobs absent from the snapshot (died, despawned, or culled away).
@@ -703,6 +774,7 @@ function applyMobs(mobs) {
     }
     mesh.instanceMatrix.needsUpdate = true;
   }
+  refreshLayerPanel();
 }
 
 async function pollMobs() {
@@ -726,10 +798,10 @@ async function pollMobs() {
 // position and rewrite its instance matrix. A few hundred translations per
 // frame is cheap; skipped entirely while hidden.
 function updateMobMarkers() {
-  if (!mobsVisible) return;
   for (const layer of Object.values(mobLayers)) {
     const mesh = layer.mesh;
     if (!mesh || layer.entries.length === 0) continue;
+    if (!layerVisible[layer.key]) continue; // hidden: positions snap on show
     for (let i = 0; i < layer.entries.length; i++) {
       const s = layer.entries[i];
       s.cur.lerp(s.target, MARKER_LERP);
@@ -739,15 +811,21 @@ function updateMobMarkers() {
   }
 }
 
-// 'm' shows/hides mob markers (plain keypress only — modifier combos like
-// Ctrl+M stay with the browser).
+// Keyboard shortcuts for the layer panel: 'p' toggles players, 'm' toggles all
+// three mob categories together (if any is showing, hide them all; otherwise
+// show them all). Plain keypresses only — modifier combos like Ctrl+M stay
+// with the browser. Both routes go through setLayerVisible, so the panel and
+// the scene can never disagree.
+const MOB_LAYER_KEYS = LAYER_KEYS.filter((k) => k !== 'players');
+
 window.addEventListener('keydown', (e) => {
-  if ((e.key === 'm' || e.key === 'M') &&
-      !e.ctrlKey && !e.metaKey && !e.altKey) {
-    mobsVisible = !mobsVisible;
-    for (const layer of Object.values(mobLayers)) {
-      if (layer.mesh) layer.mesh.visible = mobsVisible;
-    }
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const key = e.key.toLowerCase();
+  if (key === 'p') {
+    setLayerVisible('players', !layerVisible.players);
+  } else if (key === 'm') {
+    const anyShown = MOB_LAYER_KEYS.some((k) => layerVisible[k]);
+    for (const k of MOB_LAYER_KEYS) setLayerVisible(k, !anyShown);
   }
 });
 
@@ -792,6 +870,10 @@ async function main() {
 
   // Follow world edits so builds appear without a reload.
   connectLiveUpdates();
+
+  // Marker layer toggles: wire the panel before the first poll so the
+  // counts and pressed states are correct from the first snapshot.
+  initLayerPanel();
 
   // Follow players: poll the position snapshot once a second.
   pollPlayers();

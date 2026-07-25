@@ -27,12 +27,67 @@
   }
   #status.hidden { display: none; }
   #status.error { background: rgba(160, 32, 32, 0.85); }
+
+  /* Marker layer toggles (top-right). Each row's colour comes from the same
+     constant that colours the markers themselves — app.js sets --layer-color
+     so the legend can never drift from what is drawn. */
+  #layers {
+    position: fixed; top: 8px; right: 8px;
+    display: flex; flex-direction: column; gap: 1px;
+    padding: 5px; border-radius: 6px;
+    background: rgba(0, 0, 0, 0.45);
+    font: 12px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    user-select: none;
+  }
+  #layers button {
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 8px; border: 0; border-radius: 4px;
+    background: transparent; color: #fff; cursor: pointer;
+    font: inherit; text-align: left;
+  }
+  #layers button:hover { background: rgba(255, 255, 255, 0.14); }
+  #layers button:focus-visible { outline: 2px solid #fff; outline-offset: -2px; }
+  #layers .icon {
+    width: 13px; height: 13px; flex: none;
+    fill: var(--layer-color, #fff);
+  }
+  #layers .name { flex: 1; }
+  #layers .count { opacity: 0.6; font-variant-numeric: tabular-nums; }
+  /* Off: dim the row and hollow the glyph out to an outline. */
+  #layers button[aria-pressed="false"] { color: #9aa2ab; }
+  #layers button[aria-pressed="false"] .icon {
+    fill: none; stroke: var(--layer-color, #fff); stroke-width: 1.6; opacity: 0.7;
+  }
 </style>
 </head>
 <body>
 <canvas id="view"></canvas>
 <div id="hud">loading…</div>
 <div id="status">loading…</div>
+
+<!-- Marker layers. data-layer keys match the layer keys in app.js; the mob
+     glyph is a diamond because the markers themselves are octahedra. -->
+<div id="layers" role="group" aria-label="Marker layers">
+  <button type="button" data-layer="players" aria-pressed="true" title="Players — shortcut: P">
+    <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+      <circle cx="8" cy="4.5" r="3.1"/>
+      <path d="M1.8 15c0-3.4 2.8-5.3 6.2-5.3s6.2 1.9 6.2 5.3z"/>
+    </svg>
+    <span class="name">Players</span><span class="count">0</span>
+  </button>
+  <button type="button" data-layer="hostile" aria-pressed="true" title="Hostile mobs — M toggles all mobs">
+    <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1l6 7-6 7-6-7z"/></svg>
+    <span class="name">Hostile</span><span class="count">0</span>
+  </button>
+  <button type="button" data-layer="passive" aria-pressed="true" title="Passive mobs — M toggles all mobs">
+    <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1l6 7-6 7-6-7z"/></svg>
+    <span class="name">Passive</span><span class="count">0</span>
+  </button>
+  <button type="button" data-layer="other" aria-pressed="true" title="Other mobs — M toggles all mobs">
+    <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1l6 7-6 7-6-7z"/></svg>
+    <span class="name">Other</span><span class="count">0</span>
+  </button>
+</div>
 
 <!-- Map the bare "three" specifier (used by OrbitControls.js) to the vendored build. -->
 <script type="importmap">

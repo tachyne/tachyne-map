@@ -92,11 +92,12 @@ way to sanity-check terrain, water, and biome tint without a browser.
 
 ## Status
 
-The renderer, the streaming viewer, live updates, and player markers are all
-working and deployed. Known gaps: mob markers are served but not yet drawn;
-block-change events carry no dimension, so live updates are overworld-only; and
-distant terrain is not yet level-of-detail simplified, which bounds how far you
-can usefully zoom out.
+The renderer, the streaming viewer, live updates, and player and mob markers
+are all working and deployed; a layer panel toggles each marker layer
+independently. Known gaps: only the overworld is rendered (the Nether and the
+End are readable but have no dimension selector yet); block-change events carry
+no dimension, so live updates are overworld-only; and distant terrain is not yet
+level-of-detail simplified, which bounds how far you can usefully zoom out.
 
 ## Acknowledgements
 

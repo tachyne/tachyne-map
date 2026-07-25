@@ -143,7 +143,20 @@ HUD (top-left) shows resident tile count, in-flight fetch count, the focus
 chunk, camera height, the online player count, the rendered mob count, and
 the streaming radius; a top-center banner shows startup progress and errors.
 Mouse: left-drag orbits, right-drag pans, wheel zooms (OrbitControls with
-damping). Keyboard: **`m`** toggles mob markers on/off.
+damping).
+
+A **layer panel** (top-right) toggles each marker layer independently —
+players, and the hostile / passive / other mob categories — showing each
+layer's colour and current count. Keyboard: **`p`** toggles players, **`m`**
+toggles all three mob categories together (if any are showing it hides them
+all, otherwise it shows them all). Both routes call the same
+`setLayerVisible`, so the panel and the scene cannot disagree.
+
+Each row's swatch colour is set from `LAYER_COLORS` in `app.js` — the same
+constant that colours the markers themselves — so the legend cannot drift from
+what is drawn. The panel markup carries `data-layer` keys that must match
+`LAYER_KEYS`; a key present in one and not the other is ignored rather than
+throwing.
 
 ## Player markers
 
@@ -183,10 +196,12 @@ instance-matrix writes per frame is cheap. Mobs draw with
 `depthTest: false` at a `renderOrder` *below* the player markers, so players
 always stay on top.
 
-Pressing **`m`** hides/shows all mob markers (the HUD notes when they are
-hidden); polling continues while hidden so re-showing is instant and
-current. A failed or 404 fetch (older pod, testdata) is logged at debug
-level and retried on the next tick.
+Each category can be hidden on its own from the layer panel (or all three at
+once with **`m`**). Polling continues while a layer is hidden, so re-showing
+is instant and current; the per-frame easing pass skips hidden layers, and
+their positions snap rather than ease so a re-shown marker never animates
+across the distance it moved while out of sight. A failed or 404 fetch (older
+pod, testdata) is logged at debug level and retried on the next tick.
 
 ## Local development (no server)
 
