@@ -45,8 +45,10 @@ meshes any chunk on demand.
 
 ### `GET /atlas.png`
 
-The block-texture atlas: a square grid of `atlasCell`-pixel cells (the sample
-is 528×528 = 33×33 cells). Sampled with nearest filtering, no mipmaps.
+The block-texture atlas: a square grid of `atlasCell`-pixel cells, each padded
+by an edge-extended gutter (the sample is 792×792 = 33×33 slots of 24px: a 16px
+cell plus 4px of gutter a side). Magnified with nearest filtering; minified
+through mipmaps, which the gutter makes safe — see `render/atlas.go`.
 
 ### `GET /tile/{dim}/{cx}/{cz}.json`
 
@@ -109,14 +111,19 @@ Contract points the renderer depends on:
 - **Baked light in colors**: material is `MeshBasicMaterial` with
   `vertexColors: true` — vertex RGB multiplies the texel, nothing else lights
   the scene.
-- **`alphaTest: 0.5`**: cutout transparency (foliage etc.) works; smooth alpha
-  does not — bake translucency some other way if it's ever needed.
+- **`alphaTest: 0.1`**: cutout transparency (foliage etc.) works; smooth alpha
+  does not — bake translucency some other way if it's ever needed. The cutoff
+  is vanilla's 0.1 rather than a half-way one because mipmapping averages alpha
+  too, and a higher threshold erodes thin cutouts at distance.
 
 ## Streaming
 
 1. `GET manifest.json` → camera is placed above/behind `spawn`, looking at it.
-2. `GET atlas.png` → `NearestFilter` mag+min, `generateMipmaps = false`,
-   `flipY = false`, sRGB color space.
+2. `GET atlas.png` → `magFilter = NearestFilter` (crisp up close),
+   `minFilter = NearestMipMapLinearFilter` with mipmaps generated (distant
+   terrain would otherwise alias badly), `flipY = false`, sRGB color space.
+   Mipmapping is only safe because the atlas pads each cell with an
+   edge-extended gutter — see `render/atlas.go`.
 3. From then on the viewer streams: the **focus point** is the OrbitControls
    orbit/pan target; its chunk (`floor(x/16), floor(z/16)`) is the focus
    chunk. Every chunk within `LOAD_RADIUS` (Chebyshev) of the focus is
@@ -130,14 +137,41 @@ Knobs (consts at the top of `app.js`):
 
 | Const | Default | Meaning |
 |---|---|---|
-| `LOAD_RADIUS` | 8 | Keep chunks within this radius of the focus chunk — a 17×17 square, ≤289 resident tiles. |
-| `UNLOAD_MARGIN` | 2 | Only unload beyond `LOAD_RADIUS + UNLOAD_MARGIN`, so boundary tiles don't thrash. |
+| `LOAD_RADIUS` | 20 | Keep chunks within this radius of the focus chunk — a 41×41 square, ≤1681 resident tiles. |
+| `UNLOAD_MARGIN` | 4 | Only unload beyond `LOAD_RADIUS + UNLOAD_MARGIN`, so boundary tiles don't thrash. |
 | `TILE_FETCH_CONCURRENCY` | 8 | Max tile fetches in flight. |
 
 Failed fetches and 404s are cached as loaded-empty (logged at debug level,
 never retried while resident); results that arrive after the focus has moved
 out of range are discarded immediately. No coord is ever fetched twice while
 tracked.
+
+### Live refresh
+
+A tile invalidated by a world edit (SSE `tile` event) is **refreshed in
+place**, not unloaded and reloaded. It goes on a separate `refreshQueue` that
+`pumpQueue` services *ahead* of ordinary streaming loads, and the tile keeps
+drawing its current geometry for the whole round trip: `refreshTile` adds the
+replacement mesh to the scene and only then removes and disposes the old one,
+so the tile is never absent for even a frame.
+
+This matters because one block change dirties a **3×3** of chunks server-side
+(light and face culling cross chunk borders). Dropping those meshes up front —
+which is what invalidate-then-reload did — opened a 48×48 block hole around
+the player for a network round trip plus a server re-mesh, i.e. the whole area
+visibly blinked on every block placed.
+
+Two guards keep the swap honest:
+
+- `staleTiles` dedupes, so a burst of edits in one chunk coalesces into a
+  single re-fetch.
+- The queue entry records the tile state observed when it was queued, and the
+  swap only happens if `tiles.get(key)` is still that exact object. If the
+  tile was unloaded by a pan (and possibly reloaded) meanwhile, the in-flight
+  result is discarded instead of overwriting newer geometry.
+
+A refresh that fails leaves the existing geometry on screen rather than
+blanking the tile.
 
 HUD (top-left) shows resident tile count, in-flight fetch count, the focus
 chunk, camera height, the online player count, the rendered mob count, and

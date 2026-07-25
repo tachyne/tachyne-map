@@ -295,6 +295,17 @@ const tiles = new Map();
 // Rebuilt wholesale on every recompute, so stale entries simply vanish.
 let pendingQueue = [];
 
+// Re-fetches for tiles that are ALREADY resident and whose geometry a world
+// edit has invalidated. Kept separate from pendingQueue for two reasons: these
+// are serviced first (an edit you just made should appear promptly, ahead of
+// terrain streaming in from the horizon), and unlike a pending load the tile
+// stays in the scene until its replacement arrives.
+let refreshQueue = [];
+
+// Keys with a refresh queued or in flight, so a burst of edits in one chunk
+// coalesces into a single re-fetch.
+const staleTiles = new Set();
+
 const stats = { resident: 0, inFlight: 0 };
 
 // Set once the manifest + atlas are in; streaming is a no-op before that.
@@ -351,11 +362,22 @@ function unloadTile(key, state) {
     state.geometry.dispose();
   }
   tiles.delete(key);
+  staleTiles.delete(key); // a queued refresh for it is now moot
   stats.resident--;
 }
 
-// Start fetches from the pending queue up to the concurrency cap.
+// Start fetches from the queues up to the concurrency cap. Refreshes go first:
+// they are for tiles the user is looking at right now.
 function pumpQueue() {
+  while (stats.inFlight < TILE_FETCH_CONCURRENCY && refreshQueue.length > 0) {
+    const [cx, cz, key, expected] = refreshQueue.shift();
+    if (!tiles.has(key)) {      // unloaded (panned away) since it was queued
+      staleTiles.delete(key);
+      continue;
+    }
+    stats.inFlight++;
+    refreshTile(cx, cz, key, expected); // async; completion pumps again
+  }
   while (stats.inFlight < TILE_FETCH_CONCURRENCY && pendingQueue.length > 0) {
     const [cx, cz] = pendingQueue.shift();
     const key = tileKey(cx, cz);
@@ -395,6 +417,54 @@ async function loadTile(cx, cz, key) {
   pumpQueue();
 }
 
+// Re-fetch a tile that is already on screen, swapping its geometry only once
+// the replacement is in hand.
+//
+// The old mesh stays in the scene for the whole round trip and is removed in
+// the SAME operation that adds the new one, so there is never a frame with
+// neither. Dropping it up front instead — which is what "invalidate, then let
+// the streaming pass reload it" did — opened a hole for a network round trip
+// plus a server re-mesh, and since one edit dirties a 3x3 of chunks that hole
+// was a 48x48 block area blinking out around the player on every block placed.
+// `expected` is the tile state observed when the refresh was queued. If the
+// tile has changed identity since — unloaded by a pan, or unloaded and then
+// reloaded by the streaming pass — this fetch is stale and must not overwrite
+// the newer geometry.
+async function refreshTile(cx, cz, key, expected) {
+  let mesh = null; // null = the chunk is now empty (all air), a valid result
+  try {
+    const tile = await fetchTile(streaming.dim, cx, cz);
+    if (tile.indices && tile.indices.length > 0) {
+      mesh = buildTileMesh(tile, streaming.material);
+    }
+  } catch (err) {
+    // Keep whatever is on screen: a failed refresh should leave the last good
+    // geometry alone rather than blank the tile.
+    console.debug(`tile ${cx},${cz} refresh skipped:`, err.message ?? err);
+    stats.inFlight--;
+    staleTiles.delete(key);
+    pumpQueue();
+    return;
+  }
+  stats.inFlight--;
+  staleTiles.delete(key);
+
+  if (tiles.get(key) !== expected) {
+    // Superseded while in flight — drop this result, keep what is on screen.
+    if (mesh) mesh.geometry.dispose();
+  } else {
+    // Atomic swap: the replacement is added BEFORE the old mesh is removed,
+    // so the tile is never absent for even one frame.
+    if (mesh) scene.add(mesh);
+    if (expected instanceof THREE.Mesh) {
+      scene.remove(expected);
+      expected.geometry.dispose();
+    }
+    tiles.set(key, mesh); // replaces in place: stats.resident is unchanged
+  }
+  pumpQueue();
+}
+
 // Debounced recompute on camera movement + a periodic safety net.
 let streamDebounce = 0;
 controls.addEventListener('change', () => {
@@ -426,21 +496,18 @@ function connectLiveUpdates() {
   return es;
 }
 
-// Forget a tile so the next streaming pass re-fetches it with fresh geometry.
+// Queue a resident tile for in-place refresh. The tile keeps drawing its
+// current geometry until the replacement arrives (see refreshTile), so an
+// edit never blanks the area around the player.
 function invalidateTile(cx, cz) {
   const key = tileKey(cx, cz);
   const state = tiles.get(key);
-  if (state === undefined) return; // not resident — nothing to refresh
-  if (state === LOADING) return;   // in flight; it will pick up the change
-  unloadTile(key, state);
-  scheduleLiveRefresh();
-}
-
-// One edit dirties a 3x3 of tiles, so coalesce a burst into a single recompute.
-let liveDebounce = 0;
-function scheduleLiveRefresh() {
-  clearTimeout(liveDebounce);
-  liveDebounce = setTimeout(updateStreaming, 100);
+  if (state === undefined) return;  // not resident — nothing on screen to refresh
+  if (state === LOADING) return;    // initial load in flight; it fetches fresh anyway
+  if (staleTiles.has(key)) return;  // already queued or in flight
+  staleTiles.add(key);
+  refreshQueue.push([cx, cz, key, state]);
+  pumpQueue();
 }
 
 // ---------------------------------------------------------------------------
