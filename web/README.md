@@ -180,11 +180,16 @@ Mouse: left-drag orbits, right-drag pans, wheel zooms (OrbitControls with
 damping).
 
 A **layer panel** (top-right) toggles each marker layer independently —
-players, and the hostile / passive / other mob categories — showing each
-layer's colour and current count. Keyboard: **`p`** toggles players, **`m`**
-toggles all three mob categories together (if any are showing it hides them
-all, otherwise it shows them all). Both routes call the same
-`setLayerVisible`, so the panel and the scene cannot disagree.
+players, player name labels, and the hostile / passive / other mob categories —
+showing each layer's colour and current count. Keyboard: **`p`** toggles
+players, **`n`** toggles name labels, and **`m`** toggles all three mob
+categories together (if any are showing it hides them all, otherwise it shows
+them all). Both routes call the same `setLayerVisible`, so the panel and the
+scene cannot disagree.
+
+Names are their own layer because the pill sits directly above the player —
+exactly where a building player is placing blocks — and it draws with
+`depthTest: false`, so it covers them. Hiding names leaves the position dots.
 
 Each row's swatch colour is set from `LAYER_COLORS` in `app.js` — the same
 constant that colours the markers themselves — so the legend cannot drift from
@@ -199,8 +204,15 @@ slow response never stacks a second one) and reconciles a marker per `eid`:
 a colored octahedron at the player position plus a name label — white text on
 a dark pill, drawn into a canvas **once** per player and cached (rebuilt only
 on a rename). Labels use `sizeAttenuation: false` (constant screen size at
-any distance) and both parts render with `depthTest: false` at a high
-`renderOrder`, so a player underground is still findable through the terrain.
+any distance, `LABEL_SCALE` of the viewport height) and both parts render with
+`depthTest: false` at a high `renderOrder`, so a player underground is still
+findable through the terrain — which is also why the label covers whatever is
+in front of it, and why it is separately toggleable.
+
+The label canvas is drawn at a fixed resolution and rendered smaller than it,
+so its texture is **mipmapped** (`LinearMipmapLinearFilter`); without that the
+minified text aliases into noise. WebGL2 mipmaps non-power-of-two textures, so
+the odd canvas size is not an obstacle.
 Markers ease toward the latest polled position with a per-frame lerp instead
 of snapping once a second; new eids appear (snapped, no fly-in), absent eids
 are removed with their texture/materials disposed (the octahedron geometry is

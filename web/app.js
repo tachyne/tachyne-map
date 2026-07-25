@@ -71,13 +71,14 @@ const PLAYER_POLL_MS = 1000;
 const MOB_POLL_MS = 2000;
 const SKY_COLOR = 0x87ceeb; // light sky blue
 
-// The four toggleable marker layers, in panel order. Each colour is the single
+// The toggleable marker layers, in panel order. Each colour is the single
 // source of truth for BOTH the marker material and its legend swatch, so the
 // panel can never claim a colour the map doesn't draw. Players are drawn in a
 // per-player colour, so their legend glyph uses a neutral white.
-const LAYER_KEYS = ['players', 'hostile', 'passive', 'other'];
+const LAYER_KEYS = ['players', 'names', 'hostile', 'passive', 'other'];
 const LAYER_COLORS = {
   players: 0xffffff, // legend only; actual dots use playerColor(eid)
+  names: 0xffffff,   // the name pills above players
   hostile: 0xe0483a, // red
   passive: 0x5fbf5f, // green
   other: 0xd9c25a,   // muted yellow
@@ -145,6 +146,10 @@ function applyLayerVisibility(key) {
     for (const m of playerMarkers.values()) m.group.visible = visible;
     return;
   }
+  if (key === 'names') {
+    for (const m of playerMarkers.values()) m.label.visible = visible;
+    return;
+  }
   const layer = mobLayers[key];
   if (layer?.mesh) layer.mesh.visible = visible;
 }
@@ -153,10 +158,12 @@ function applyLayerVisibility(key) {
 function refreshLayerPanel() {
   for (const [key, { button, countEl }] of layerControls) {
     button.setAttribute('aria-pressed', String(layerVisible[key]));
-    const n = key === 'players'
-      ? playerMarkers.size
-      : (mobLayers[key]?.entries.length ?? 0);
-    const text = String(n);
+    let text = '';
+    if (key === 'players') {
+      text = String(playerMarkers.size);
+    } else if (key !== 'names') { // a names count would just restate players
+      text = String(mobLayers[key]?.entries.length ?? 0);
+    }
     if (countEl.textContent !== text) countEl.textContent = text;
   }
 }
@@ -530,9 +537,12 @@ function invalidateTile(cx, cz) {
 
 // How far above the player position the name label is anchored (world units).
 const LABEL_LIFT = 2.2;
-// Label screen height with sizeAttenuation:false — clip-space-ish units where
-// ~0.05 is a few percent of the viewport height.
-const LABEL_SCALE = 0.055;
+// Label screen height with sizeAttenuation:false — clip-space-ish units,
+// roughly a fraction of the viewport height. Kept small deliberately: the
+// label sits directly above the player, which is exactly where a building
+// player is placing blocks, so a big pill hides the thing you are watching.
+// Press 'n' (or use the layer panel) to hide labels entirely.
+const LABEL_SCALE = 0.032;
 // Per-frame lerp factor easing a marker toward its latest polled position.
 const MARKER_LERP = 0.2;
 
@@ -585,8 +595,11 @@ function makeLabelTexture(name) {
 
   const tex = new THREE.CanvasTexture(canvas);
   tex.colorSpace = THREE.SRGBColorSpace;
-  tex.minFilter = THREE.LinearFilter; // odd-sized canvas: no mipmaps
-  tex.generateMipmaps = false;
+  // The pill is drawn smaller than its canvas, so it is minified: mipmap it
+  // or the text aliases into noise. WebGL2 mipmaps non-power-of-two textures
+  // fine, which is why the odd canvas size is no longer a reason to skip them.
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.generateMipmaps = true;
   return tex;
 }
 
@@ -621,11 +634,13 @@ function addPlayerMarker(p) {
   label.position.y = LABEL_LIFT;
   label.center.set(0.5, 0); // anchor bottom-center: pill grows upward on screen
   label.renderOrder = 1000; // labels above dots
+  label.visible = layerVisible.names; // added while names are hidden: stay hidden
 
   group.add(dot, label);
   scene.add(group);
   playerMarkers.set(p.eid, {
     group,
+    label,
     target: new THREE.Vector3(p.x, p.y, p.z),
     name,
     labelTexture,
@@ -660,7 +675,7 @@ function applyPlayers(players) {
       m.labelTexture.dispose();
       m.labelTexture = makeLabelTexture(name);
       m.labelMaterial.map = m.labelTexture;
-      scaleLabel(m.group.children[1], m.labelTexture);
+      scaleLabel(m.label, m.labelTexture);
       m.name = name;
     }
   }
@@ -883,13 +898,15 @@ function updateMobMarkers() {
 // show them all). Plain keypresses only — modifier combos like Ctrl+M stay
 // with the browser. Both routes go through setLayerVisible, so the panel and
 // the scene can never disagree.
-const MOB_LAYER_KEYS = LAYER_KEYS.filter((k) => k !== 'players');
+const MOB_LAYER_KEYS = LAYER_KEYS.filter((k) => k !== 'players' && k !== 'names');
 
 window.addEventListener('keydown', (e) => {
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   const key = e.key.toLowerCase();
   if (key === 'p') {
     setLayerVisible('players', !layerVisible.players);
+  } else if (key === 'n') {
+    setLayerVisible('names', !layerVisible.names);
   } else if (key === 'm') {
     const anyShown = MOB_LAYER_KEYS.some((k) => layerVisible[k]);
     for (const k of MOB_LAYER_KEYS) setLayerVisible(k, !anyShown);
