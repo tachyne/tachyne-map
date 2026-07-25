@@ -20,8 +20,15 @@ second or so, and players show as live markers.
   camera and unloads them behind you, so you can pan across the world
   indefinitely with bounded memory. The pod meshes any chunk on demand.
 - **Live.** The map subscribes to the engine's block-change events and re-meshes
-  only the affected tiles, pushing invalidations to browsers over SSE. It also
-  shows player positions, and serves mob positions for markers.
+  only the affected tiles, pushing invalidations to browsers over SSE. A tile is
+  replaced in place — its current geometry keeps drawing until the new mesh
+  arrives — so an edit never blanks the area around the player. It also shows
+  player positions, and serves mob positions for markers.
+- **Starts current.** On boot the map subscribes FIRST, then asks the engine to
+  flush its world file, then reads it. Reading before subscribing would lose
+  everything built between the engine's last autosave and the subscription —
+  edits in neither the file nor the event stream, missing until the next
+  restart.
 - **Reads the world, never writes it.** The engine stays the only writer: the
   map opens the world read-only through tachyne-world's `worldread` facade,
   which has no save path.
