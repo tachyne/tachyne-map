@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"sync"
 
 	"github.com/tachyne/tachyne-world/busplugin"
 )
@@ -50,14 +51,76 @@ func discoverWorld(c *busplugin.Conn) *worldInfo {
 	return &info
 }
 
-// followBlockChanges replays the engine's block edits into the map's own
-// in-memory world and marks the affected tiles dirty, so the viewer sees
-// builds appear within a flush interval.
-func (s *server) followBlockChanges(c *busplugin.Conn) error {
-	_, err := busplugin.On(c, "block_change", func(ev blockChange) {
-		s.applyBlockChange(ev)
-	})
-	return err
+// requestSave asks the engine to flush its world file to disk right now.
+//
+// The map bootstraps by reading that file and then tailing block_change. The
+// engine only autosaves every 30s, so without this the snapshot is up to a
+// full interval stale AND those edits never arrive on the event stream (they
+// happened before we subscribed) — they stay missing until the next restart.
+// Someone building quickly loses a visible chunk of their work from the map.
+//
+// A pre-save engine answers "unknown command", which is not fatal: the map
+// then behaves exactly as it did before.
+func requestSave(c *busplugin.Conn) {
+	var out struct {
+		Edits int `json:"edits"`
+	}
+	if err := c.Request("save", nil, &out); err != nil {
+		log.Printf("bus: save request failed (%v) — snapshot may miss up to one autosave interval", err)
+		return
+	}
+	log.Printf("bus: engine flushed the world file (%d block edits) before the snapshot read", out.Edits)
+}
+
+// bootFollower replays the engine's block edits into the map's own in-memory
+// world (marking the affected tiles dirty, so the viewer sees builds appear
+// within a flush interval) and subscribes BEFORE the world snapshot has been
+// read, buffering what arrives until a server exists to apply it to.
+//
+// Order matters: subscribe, then ask for a save, then read the snapshot. Any
+// edit made during that sequence lands in the buffer rather than falling into
+// the gap between "not yet in the file" and "not yet subscribed".
+type bootFollower struct {
+	mu  sync.Mutex
+	buf []blockChange
+	srv *server // nil until attach; while nil, events are buffered
+}
+
+func followFromBoot(c *busplugin.Conn) (*bootFollower, error) {
+	f := &bootFollower{}
+	if _, err := busplugin.On(c, "block_change", f.handle); err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+// handle buffers an edit while the snapshot is still loading, or applies it
+// directly once attached.
+func (f *bootFollower) handle(ev blockChange) {
+	f.mu.Lock()
+	if f.srv == nil {
+		f.buf = append(f.buf, ev)
+		f.mu.Unlock()
+		return
+	}
+	srv := f.srv
+	f.mu.Unlock()
+	srv.applyBlockChange(ev)
+}
+
+// attach drains everything buffered during bootstrap into srv and switches to
+// direct application. The lock is held across the drain so an event arriving
+// mid-attach queues behind it and can never be applied out of order.
+func (f *bootFollower) attach(srv *server) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, ev := range f.buf {
+		srv.applyBlockChange(ev)
+	}
+	n := len(f.buf)
+	f.buf = nil
+	f.srv = srv
+	return n
 }
 
 // applyBlockChange mutates the map's world view and queues the re-render.

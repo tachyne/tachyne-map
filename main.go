@@ -85,6 +85,22 @@ func main() {
 		}
 	}
 
+	// Bootstrap order is deliberate: SUBSCRIBE, then ask the engine to flush
+	// its world file, then read that file. Reading first (as this used to)
+	// leaves everything built between the engine's last autosave and our
+	// subscription in neither the snapshot nor the event stream, so it stays
+	// missing from the map until the next restart.
+	var follower *bootFollower
+	if bus != nil {
+		var err error
+		if follower, err = followFromBoot(bus); err != nil {
+			log.Printf("bus: block_change subscribe failed (%v) — no live updates", err)
+			follower = nil
+		} else {
+			requestSave(bus)
+		}
+	}
+
 	// With a world file the map also shows everything players have BUILT (the
 	// engine's edit overlay), not just generated terrain. It is opened
 	// read-only and never saved — see worldread's SetBlock/Save contract — so
@@ -121,12 +137,13 @@ func main() {
 	srv.manifest = srv.buildManifest(*cx, *cz, *radius)
 	go srv.runFlusher()
 
-	if bus != nil {
-		if err := srv.followBlockChanges(bus); err != nil {
-			log.Printf("bus: block_change subscribe failed (%v) — no live updates", err)
-		} else {
-			log.Printf("bus: following block changes — the map updates live")
+	if follower != nil {
+		if n := follower.attach(srv); n > 0 {
+			log.Printf("bus: applied %d block change(s) that arrived during startup", n)
 		}
+		log.Printf("bus: following block changes — the map updates live")
+	}
+	if bus != nil {
 		go srv.players.runPlayerPoll(bus)
 	}
 
