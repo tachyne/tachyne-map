@@ -157,10 +157,20 @@ function loadAtlas(url) {
       // Tile UVs measure V from the TOP of the atlas image; disabling the
       // default Y-flip on upload makes v=0 sample the top row directly.
       tex.flipY = false;
-      // Crisp pixels: no filtering, no mipmaps (cells would bleed).
+      // Crisp up close, mipmapped at distance. magFilter stays Nearest so
+      // blocks keep their pixel-art edges when magnified; minFilter blends
+      // BETWEEN mip levels but samples nearest WITHIN one, so distant terrain
+      // stops aliasing without the texels themselves going soft.
+      //
+      // Minifying with Nearest was what made the map look grainy: at map
+      // distances one screen pixel covers many texels, so it picked a single
+      // arbitrary one and the choice churned as the camera moved. Mipmapping
+      // is only safe because the atlas pads every cell with an edge-extended
+      // gutter (render/atlas.go) — coarse levels would otherwise average
+      // neighbouring sprites together.
       tex.magFilter = THREE.NearestFilter;
-      tex.minFilter = THREE.NearestFilter;
-      tex.generateMipmaps = false;
+      tex.minFilter = THREE.NearestMipMapLinearFilter;
+      tex.generateMipmaps = true;
       tex.colorSpace = THREE.SRGBColorSpace;
       resolve(tex);
     }, undefined, () => reject(new Error(`failed to load ${url}`)));
@@ -766,7 +776,11 @@ async function main() {
     map: atlas,
     vertexColors: true,     // baked light+tint multiplies the atlas texture
     side: THREE.FrontSide,  // tiles are CCW-wound front faces
-    alphaTest: 0.5,         // cutout foliage/glass; no sorting needed
+    // Cutout foliage/glass; no sorting needed. Vanilla's 0.1 cutoff, not a
+    // half-way one: mipmapping averages alpha as well as colour, so a 0.5
+    // threshold would erode thin cutouts (grass blades, leaf gaps) into
+    // nothing as they shrink into the coarser levels.
+    alphaTest: 0.1,
   });
 
   // Everything is ready — start streaming tiles around the focus point.

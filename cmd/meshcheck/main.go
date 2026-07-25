@@ -47,7 +47,7 @@ func main() {
 
 	locs, _ := render.ReferencedBlockTextures(a)
 	locs = append(locs, render.FluidTextures...)
-	atlas := render.BuildAtlas(a, locs, 16)
+	atlas := render.BuildAtlas(a, locs, 16, render.DefaultGutter)
 	cm, err := render.LoadColormaps(a)
 	if err != nil {
 		log.Fatalf("colormaps: %v", err)

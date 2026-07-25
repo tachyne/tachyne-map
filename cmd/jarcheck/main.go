@@ -133,7 +133,7 @@ func main() {
 
 	locs, _ := render.ReferencedBlockTextures(a)
 	fmt.Printf("referenced block textures: %d\n", len(locs))
-	at := render.BuildAtlas(a, locs, 16)
+	at := render.BuildAtlas(a, locs, 16, render.DefaultGutter)
 	fmt.Printf("atlas: %d sprites, image %dx%d px\n",
 		len(at.Sprites), at.Img.Bounds().Dx(), at.Img.Bounds().Dy())
 	for _, l := range []string{"minecraft:block/stone", "minecraft:block/grass_block_top", "minecraft:block/oak_planks"} {

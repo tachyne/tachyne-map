@@ -17,26 +17,46 @@ type Sprite struct {
 	U0, V0, U1, V1 float64
 }
 
+// DefaultGutter is the edge-extended padding placed around every atlas cell,
+// as a fraction of the cell edge. Four texels at vanilla's 16px cell leaves the
+// first three mipmap levels (16→8→4) sampling a sprite only against copies of
+// its own border, which covers every minification the viewer actually reaches:
+// at the streaming radius a block is still ~4 screen pixels.
+const DefaultGutter = 4
+
 // Atlas is a grid of block textures stitched into one image, with the UV rect
 // of each source texture. The mesher maps a face's 0..16 model UV into the
 // sprite's rect to get final atlas coordinates.
+//
+// Each cell sits in a larger slot, padded by Gutter texels of its own
+// edge-extended border. Without that padding the atlas cannot be mipmapped —
+// coarse levels would average neighbouring sprites together — and without
+// mipmaps distant terrain aliases badly, because one screen pixel then samples
+// a single arbitrary texel out of the 256 it covers.
 type Atlas struct {
 	Img     *image.RGBA
 	Sprites map[string]Sprite // texture location -> UV rect
 	Cell    int               // cell edge, pixels
+	Gutter  int               // edge-extended padding around each cell, pixels
 	Missing Sprite            // fallback rect for textures that failed to load
 }
 
 // BuildAtlas stitches the given texture locations into a square-ish grid atlas
-// at cell×cell pixels each (cell<=0 defaults to 16, vanilla's base size).
+// at cell×cell pixels each (cell<=0 defaults to 16, vanilla's base size),
+// padded by gutter texels of edge extension (gutter<0 defaults to
+// DefaultGutter; 0 disables padding and makes the atlas unsafe to mipmap).
 // Animated textures contribute their first frame; non-cell sizes are
 // nearest-neighbor scaled so the grid stays uniform and pixel-art crisp. A
 // synthetic magenta "missing" cell is always slot 0 and is used for any
 // texture that fails to load.
-func BuildAtlas(a *Assets, locs []string, cell int) *Atlas {
+func BuildAtlas(a *Assets, locs []string, cell, gutter int) *Atlas {
 	if cell <= 0 {
 		cell = 16
 	}
+	if gutter < 0 {
+		gutter = DefaultGutter
+	}
+	slot := cell + 2*gutter
 	uniq := dedupeSorted(locs)
 
 	// Slot 0 is the missing-texture sprite; real textures follow.
@@ -44,14 +64,17 @@ func BuildAtlas(a *Assets, locs []string, cell int) *Atlas {
 	cols := int(math.Ceil(math.Sqrt(float64(n))))
 	rows := (n + cols - 1) / cols
 	at := &Atlas{
-		Img:     image.NewRGBA(image.Rect(0, 0, cols*cell, rows*cell)),
+		Img:     image.NewRGBA(image.Rect(0, 0, cols*slot, rows*slot)),
 		Sprites: make(map[string]Sprite, len(uniq)),
 		Cell:    cell,
+		Gutter:  gutter,
 	}
 
 	place := func(idx int, src *image.RGBA) Sprite {
-		cx, cy := (idx%cols)*cell, (idx/cols)*cell
+		sx, sy := (idx%cols)*slot, (idx/cols)*slot
+		cx, cy := sx+gutter, sy+gutter
 		draw.Draw(at.Img, image.Rect(cx, cy, cx+cell, cy+cell), src, image.Point{}, draw.Src)
+		extendEdges(at.Img, sx, sy, cell, gutter)
 		w, h := float64(at.Img.Bounds().Dx()), float64(at.Img.Bounds().Dy())
 		return Sprite{
 			U0: float64(cx) / w, V0: float64(cy) / h,
@@ -105,6 +128,29 @@ func loadSprite(a *Assets, loc string, cell int) (*image.RGBA, error) {
 		return frame, nil
 	}
 	return nearestScale(frame, cell), nil
+}
+
+// extendEdges fills the gutter ring of the slot at (slotX,slotY) by clamping to
+// the nearest pixel of the cell it surrounds. Every texel a mipmap level can
+// reach outside a sprite is then a copy of that sprite's own border rather than
+// its neighbour in the grid, so coarser levels stay free of colour bleed.
+func extendEdges(img *image.RGBA, slotX, slotY, cell, gutter int) {
+	if gutter <= 0 {
+		return
+	}
+	slot := cell + 2*gutter
+	for y := 0; y < slot; y++ {
+		for x := 0; x < slot; x++ {
+			if x >= gutter && x < gutter+cell && y >= gutter && y < gutter+cell {
+				continue // the cell itself, already drawn
+			}
+			src := image.Point{
+				X: slotX + gutter + clampInt(x-gutter, 0, cell-1),
+				Y: slotY + gutter + clampInt(y-gutter, 0, cell-1),
+			}
+			img.SetRGBA(slotX+x, slotY+y, img.RGBAAt(src.X, src.Y))
+		}
+	}
 }
 
 // nearestScale resamples src to size×size with nearest-neighbor (keeps the

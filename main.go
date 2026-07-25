@@ -62,7 +62,7 @@ func main() {
 		log.Fatalf("scan textures: %v", err)
 	}
 	locs = append(locs, render.FluidTextures...)
-	atlas := render.BuildAtlas(assets, locs, 16)
+	atlas := render.BuildAtlas(assets, locs, 16, render.DefaultGutter)
 	cm, err := render.LoadColormaps(assets)
 	if err != nil {
 		log.Fatalf("colormaps: %v", err)
