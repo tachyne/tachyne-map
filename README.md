@@ -75,6 +75,9 @@ Every flag has an environment variable, so a pod can be configured without args.
 | `-version` | `MAP_VERSION` | `1.21.11` | Minecraft asset version |
 | `-cache` | `MAP_CACHE` | `/var/cache/tachyne-map` | asset cache directory |
 | `-accept-download` | `MAP_ACCEPT_DOWNLOAD` | `false` | assert acceptance of Mojang's EULA |
+| `-cx` | `MAP_CX` | `0` | initial camera chunk X |
+| `-cz` | `MAP_CZ` | `0` | initial camera chunk Z |
+| `-surface-depth` | `MAP_SURFACE_DEPTH` | `24` | blocks meshed below the surface |
 
 The bus and the world file are both optional: with neither, the map serves a
 static, terrain-only view of a seed.
