@@ -19,7 +19,7 @@ import (
 )
 
 func main() {
-	version := flag.String("version", "1.21.11", "Minecraft version to validate against")
+	version := flag.String("version", "26.3", "Minecraft version to validate against (the engine's canonical version)")
 	cache := flag.String("cache", defaultCache(), "asset cache dir")
 	verbose := flag.Bool("v", false, "list sample failures")
 	atlasOut := flag.String("atlas", "", "if set, build the block atlas and write it to this PNG path")

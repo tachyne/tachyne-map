@@ -72,7 +72,7 @@ Every flag has an environment variable, so a pod can be configured without args.
 | `-world` | `MAP_WORLD` | *(none)* | engine `world.gob`, read-only, to show player builds |
 | `-seed` | `MAP_SEED` | `1` | fallback seed when the bus is unavailable |
 | `-radius` | `MAP_RADIUS` | `8` | advertised region radius, in chunks |
-| `-version` | `MAP_VERSION` | `1.21.11` | Minecraft asset version |
+| `-version` | `MAP_VERSION` | `26.3` | Minecraft asset version — the engine's canonical version |
 | `-cache` | `MAP_CACHE` | `/var/cache/tachyne-map` | asset cache directory |
 | `-accept-download` | `MAP_ACCEPT_DOWNLOAD` | `false` | assert acceptance of Mojang's EULA |
 | `-cx` | `MAP_CX` | `0` | initial camera chunk X |

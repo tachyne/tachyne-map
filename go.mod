@@ -2,7 +2,7 @@ module github.com/tachyne/tachyne-map
 
 go 1.26
 
-require github.com/tachyne/tachyne-world v0.0.0-20260724213555-3b90a351ca67
+require github.com/tachyne/tachyne-world v0.0.0-20261004121219-85133967041b
 
 require (
 	github.com/klauspost/compress v1.18.6 // indirect

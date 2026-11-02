@@ -33,7 +33,9 @@ var webFS embed.FS
 func main() {
 	addr := flag.String("addr", envOr("MAP_ADDR", ":8100"), "HTTP listen address")
 	seed := flag.Int64("seed", envInt64("MAP_SEED", 1), "world seed (cluster classic world = 1)")
-	version := flag.String("version", envOr("MAP_VERSION", "1.21.11"), "Minecraft asset version")
+	// The client whose textures and models draw the blocks: the engine's
+	// canonical version, so every block the world holds has its art.
+	version := flag.String("version", envOr("MAP_VERSION", "26.3"), "Minecraft asset version (the engine's canonical version)")
 	cacheDir := flag.String("cache", envOr("MAP_CACHE", "/var/cache/tachyne-map"), "asset cache dir")
 	accept := flag.Bool("accept-download", envBool("MAP_ACCEPT_DOWNLOAD", false),
 		"assert acceptance of Mojang's EULA to fetch the client jar")

@@ -206,3 +206,18 @@ func countModel(refs []ModelRef, model string) int {
 	}
 	return n
 }
+
+// Since 26.1 a texture slot may be an object naming its sprite (the stained
+// glass and panes are written so); it reads as the sprite's location.
+func TestTextureSlotObject(t *testing.T) {
+	var m RawModel
+	src := `{"parent":"minecraft:block/template_glass_pane_side","textures":{` +
+		`"edge":{"force_translucent":true,"sprite":"minecraft:block/black_stained_glass_pane_top"},` +
+		`"pane":"minecraft:block/black_stained_glass"}}`
+	if err := json.Unmarshal([]byte(src), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.Textures["edge"] != "minecraft:block/black_stained_glass_pane_top" || m.Textures["pane"] != "minecraft:block/black_stained_glass" {
+		t.Errorf("textures %v", m.Textures)
+	}
+}

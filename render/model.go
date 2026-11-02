@@ -9,16 +9,50 @@
 // "#name" variables that must be chased to a concrete texture location.
 package render
 
-import "strings"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // RawModel is one block-model JSON file exactly as authored, before parent
 // flattening. Optional scalars are pointers so "absent" is distinguishable
 // from "zero" (e.g. ambientocclusion defaults to true, not false).
 type RawModel struct {
-	Parent           string            `json:"parent"`
-	AmbientOcclusion *bool             `json:"ambientocclusion"`
-	Textures         map[string]string `json:"textures"`
-	Elements         []Element         `json:"elements"`
+	Parent           string     `json:"parent"`
+	AmbientOcclusion *bool      `json:"ambientocclusion"`
+	Textures         TextureMap `json:"textures"`
+	Elements         []Element  `json:"elements"`
+}
+
+// TextureMap is a model's "textures": each slot names a texture — as a
+// location or "#ref" string, or, since 26.1, as an object
+// {"sprite": "<location>", "force_translucent": true} (the stained glass and
+// panes are written that way). Both decode to the location string; the
+// translucency flag is the mesher's business, decided per block.
+type TextureMap map[string]string
+
+func (t *TextureMap) UnmarshalJSON(b []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	out := make(TextureMap, len(raw))
+	for k, v := range raw {
+		var s string
+		if err := json.Unmarshal(v, &s); err == nil {
+			out[k] = s
+			continue
+		}
+		var o struct {
+			Sprite string `json:"sprite"`
+		}
+		if err := json.Unmarshal(v, &o); err != nil {
+			return err
+		}
+		out[k] = o.Sprite
+	}
+	*t = out
+	return nil
 }
 
 // Element is one box of a model, in Mojang's 0..16 model space.
