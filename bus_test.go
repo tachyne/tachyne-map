@@ -141,3 +141,24 @@ func TestBootFollowerAttachRacesWithIncomingEdits(t *testing.T) {
 		}
 	}
 }
+
+// Another world's change is not this map's: the engine publishes every
+// world's block changes on one subject, tagged with its dimension. A change
+// with no dimension (an engine from before the tag) is the overworld's.
+func TestBlockChangeFollowsItsOwnWorld(t *testing.T) {
+	srv := testServer(t)
+	const x, y, z = 40, 200, 40
+	nether, over := 1, 0
+	srv.applyBlockChange(blockChange{X: x, Y: y, Z: z, Dim: &nether, State: 5})
+	if got := stateAt(t, srv, x, y, z); got == 5 {
+		t.Fatal("a Nether block change was applied to the overworld map")
+	}
+	srv.applyBlockChange(blockChange{X: x, Y: y, Z: z, Dim: &over, State: 6})
+	if got := stateAt(t, srv, x, y, z); got != 6 {
+		t.Fatalf("an overworld change: got %d, want 6", got)
+	}
+	srv.applyBlockChange(blockChange{X: x, Y: y + 1, Z: z, State: 7})
+	if got := stateAt(t, srv, x, y+1, z); got != 7 {
+		t.Fatalf("an untagged change: got %d, want 7", got)
+	}
+}

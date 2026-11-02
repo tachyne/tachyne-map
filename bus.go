@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/tachyne/tachyne-world/busplugin"
+	"github.com/tachyne/tachyne-world/worldread"
 )
 
 // The map follows the running engine over the NATS bus rather than sharing its
@@ -18,10 +19,15 @@ import (
 // `by` is deliberately json.RawMessage: the engine sends an entity id (number)
 // for a player edit but the string "world" for a plugin/bus edit, so a typed
 // field would fail to unmarshal on every plugin edit. The map doesn't use it.
+//
+// `dim` is the dimension id the change happened in (0 overworld, 1 Nether,
+// 2 End, 3 the shipyard). Engines from before it carried one send none; those
+// changes are the overworld's, as they always were taken.
 type blockChange struct {
 	X     int             `json:"x"`
 	Y     int             `json:"y"`
 	Z     int             `json:"z"`
+	Dim   *int            `json:"dim"`
 	State uint32          `json:"state"`
 	By    json.RawMessage `json:"by"`
 }
@@ -125,8 +131,16 @@ func (f *bootFollower) attach(srv *server) int {
 
 // applyBlockChange mutates the map's world view and queues the re-render.
 func (s *server) applyBlockChange(ev blockChange) {
-	// Note: block_change carries no dimension, so these are treated as
-	// overworld edits (which is what the engine publishes for player edits).
+	// Only this map's own world: the engine publishes every world's changes
+	// on the one subject, and applying a Nether or shipyard block here
+	// painted it onto the overworld at the same coordinates.
+	dim := int(worldread.Overworld)
+	if ev.Dim != nil {
+		dim = *ev.Dim
+	}
+	if dim != int(s.reader.Dim()) {
+		return
+	}
 	s.reader.SetBlock(ev.X, ev.Y, ev.Z, ev.State)
 	s.worldVersion.Add(1)
 	s.live.markDirty(ev.X, ev.Z)
