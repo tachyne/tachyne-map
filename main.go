@@ -10,17 +10,20 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"embed"
 	"encoding/json"
 	"flag"
+	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/tachyne/tachyne-map/render"
 	"github.com/tachyne/tachyne-world/busplugin"
@@ -131,7 +134,8 @@ func main() {
 		mesher:   mesher,
 		reader:   reader,
 		atlasPNG: atlasBuf.Bytes(),
-		cache:    map[[2]int]*render.Tile{},
+		tiles:    newTileCache(tileCacheBudget),
+		epoch:    strconv.FormatInt(time.Now().UnixNano(), 36),
 		dim:      reader.Dim().String(),
 		live:     newLiveHub(),
 		players:  newPlayerTracker(),
@@ -186,20 +190,9 @@ type server struct {
 	// arrived, leaving it stuck until the next edit.
 	worldVersion atomic.Uint64
 
-	mu    sync.Mutex
-	cache map[[2]int]*render.Tile
-	order [][2]int // insertion order, for bounded eviction
+	tiles *tileCache // meshed tiles, gzipped, LRU by bytes (tilecache.go)
+	epoch string     // this process's start, the head of every tile ETag
 }
-
-// maxCachedTiles bounds the meshed-tile cache so the streaming viewer panning
-// across the world can't grow pod memory without limit (re-meshing is ~15ms).
-//
-// Sized deliberately small: a tile is ~0.5 MB of geometry, and the pod ALSO
-// carries the world's own byte-budgeted caches (generated chunks ~256 MB +
-// light). At 1500 this cache alone was ~750 MB and panning into fresh terrain
-// — which grows all three at once — OOM-killed the pod. The viewer keeps its
-// own resident ring (~289 tiles), so this only needs to cover revisits.
-const maxCachedTiles = 256
 
 // buildManifest advertises the served region: the tile grid plus spawn/atlas
 // metadata the viewer needs.
@@ -254,46 +247,49 @@ func (s *server) handleTile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tile := s.tile(cx, cz)
+	// A tile's ETag names this process and the tile's generation, which moves
+	// on whenever the world changes under it; browsers revalidate (no-cache)
+	// and an unchanged tile costs a 304 — no meshing, nothing sent.
+	key := [2]int{cx, cz}
+	g := s.tiles.generation(key)
+	etag := fmt.Sprintf(`"%s-%d"`, s.epoch, g)
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Vary", "Accept-Encoding")
+	if r.Header.Get("If-None-Match") == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	gz := s.tileGZ(key, g)
 	w.Header().Set("Content-Type", "application/json")
 	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 		w.Header().Set("Content-Encoding", "gzip")
-		tile.EncodeGZ(w)
+		w.Write(gz)
 		return
 	}
-	tile.EncodeJSON(w)
+	zr, err := gzip.NewReader(bytes.NewReader(gz))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	io.Copy(w, zr)
 }
 
-// tile returns the meshed tile for (cx,cz), meshing and caching on first request.
-func (s *server) tile(cx, cz int) *render.Tile {
-	key := [2]int{cx, cz}
-	s.mu.Lock()
-	if t, ok := s.cache[key]; ok {
-		s.mu.Unlock()
-		return t
+// tileGZ returns the gzipped tile for key, meshing and caching it on a miss.
+// g is the tile's generation when the request began: a tile the world
+// changed under while it was meshing is served but not cached.
+func (s *server) tileGZ(key [2]int, g uint32) []byte {
+	if gz, ok := s.tiles.get(key); ok {
+		return gz
 	}
-	s.mu.Unlock()
-
-	ver := s.worldVersion.Load()
-	t := s.mesher.MeshChunk(s.reader, cx, cz)
-	if s.worldVersion.Load() != ver {
-		return t // the world changed while meshing: serve it, don't cache it
+	t := s.mesher.MeshChunk(s.reader, key[0], key[1])
+	gz, err := gzBytes(func(b *bytes.Buffer) error { return t.EncodeGZ(b) })
+	if err != nil {
+		log.Printf("tile %d,%d: encode: %v", key[0], key[1], err)
+		return nil
 	}
-
-	s.mu.Lock()
-	if _, ok := s.cache[key]; !ok {
-		s.cache[key] = t
-		s.order = append(s.order, key)
-		if len(s.order) > maxCachedTiles {
-			n := maxCachedTiles / 5 // evict the oldest fifth
-			for _, k := range s.order[:n] {
-				delete(s.cache, k)
-			}
-			s.order = append(s.order[:0], s.order[n:]...)
-		}
-	}
-	s.mu.Unlock()
-	return t
+	s.tiles.put(key, g, gz)
+	return gz
 }
 
 func envOr(key, def string) string {

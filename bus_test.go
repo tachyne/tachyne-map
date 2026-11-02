@@ -4,7 +4,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/tachyne/tachyne-map/render"
 	"github.com/tachyne/tachyne-world/worldread"
 )
 
@@ -16,7 +15,7 @@ func testServer(t *testing.T) *server {
 	if err != nil {
 		t.Fatalf("open world: %v", err)
 	}
-	return &server{reader: reader, live: newLiveHub(), cache: map[[2]int]*render.Tile{}}
+	return &server{reader: reader, live: newLiveHub(), tiles: newTileCache(tileCacheBudget)}
 }
 
 // stateAt reads one block through the chunk view, the same way the mesher

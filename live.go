@@ -104,11 +104,7 @@ func (s *server) runFlusher() {
 		if len(keys) == 0 {
 			continue
 		}
-		s.mu.Lock()
-		for _, k := range keys {
-			delete(s.cache, k)
-		}
-		s.mu.Unlock()
+		s.tiles.invalidate(keys)
 		for _, k := range keys {
 			s.live.publish(k)
 		}
