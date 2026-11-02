@@ -100,6 +100,13 @@ go run . -accept-download -seed 1                           # run the map locall
 `cmd/meshcheck` can also write a top-down preview PNG (`-png`), which is a quick
 way to sanity-check terrain, water, and biome tint without a browser.
 
+## Controls
+
+The viewer moves like a map: drag with the left button to move across the
+ground, drag with the right button to turn and tilt, and scroll to zoom toward
+the cursor. The arrow keys pan. On a touch screen, one finger pans and two
+zoom and turn. The view stops short of the ground and of the horizon.
+
 ## Status
 
 The renderer, the streaming viewer, live updates, and player and mob markers

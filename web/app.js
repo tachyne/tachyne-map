@@ -176,7 +176,7 @@ function updateHUD() {
     `height ${camera.position.y.toFixed(1)}\n` +
     `players ${playerMarkers.size}\n` +
     `mobs   ${mobCount}\n` +
-    `streaming r=${LOAD_RADIUS}${live ? ' · live' : ''}`;
+    `streaming r=${loadRadius}${live ? ' · live' : ''}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +200,25 @@ const camera = new THREE.PerspectiveCamera(
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
-controls.dampingFactor = 0.1;
+controls.dampingFactor = 0.12;
+// Map controls, not an orbit around one object: left-drag moves across the
+// ground, right-drag turns and tilts, the wheel zooms toward the cursor —
+// the way map viewers work. Panning slides along the ground plane rather
+// than the screen, so the pivot stays on the ground: panning in screen space
+// carried it up into the sky or down under the terrain at any tilt, and every
+// rotation and zoom after that swung about a point far from what was on
+// screen.
+controls.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
+controls.touches = { ONE: THREE.TOUCH.PAN, TWO: THREE.TOUCH.DOLLY_ROTATE };
+controls.screenSpacePanning = false;
+controls.zoomToCursor = true;
+controls.zoomSpeed = 1.4;
+controls.panSpeed = 1.0;
+controls.keyPanSpeed = 30;
+controls.listenToKeyEvents(window);   // arrow keys pan
+// No zooming into the ground, and no tilting below the horizon.
+controls.minDistance = 4;
+controls.maxPolarAngle = Math.PI * 0.48;
 // Keep the camera inside the streamed region: zooming out past the loaded
 // ring is what makes the world look like it's disappearing at the edges.
 // LOAD_RADIUS chunks * 16 blocks, with margin for the viewing angle.
@@ -255,36 +273,45 @@ function loadAtlas(url) {
 // ---------------------------------------------------------------------------
 
 // Build one BufferGeometry mesh from a Tile JSON payload.
+// The tile's arrays arrive typed and checked from a worker (tileworker.js),
+// so building the mesh is just wrapping them.
 function buildTileMesh(tile, material) {
-  const { positions, uvs, colors, indices } = tile;
-  const vcount = positions.length / 3;
-
-  // Cheap sanity checks — a malformed tile should be loud, not garbled.
-  if (uvs.length !== vcount * 2 || colors.length !== vcount * 3) {
-    throw new Error(
-      `tile ${tile.cx},${tile.cz}: attribute length mismatch ` +
-      `(pos ${positions.length}, uv ${uvs.length}, col ${colors.length})`);
-  }
-  for (let i = 0; i < indices.length; i++) {
-    if (indices[i] >= vcount) {
-      throw new Error(`tile ${tile.cx},${tile.cz}: index ${indices[i]} out of range (${vcount} verts)`);
-    }
-  }
-
   const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
-  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-  geo.setIndex(indices); // three picks Uint16/Uint32 storage as needed
+  geo.setAttribute('position', new THREE.BufferAttribute(tile.positions, 3));
+  geo.setAttribute('uv', new THREE.BufferAttribute(tile.uvs, 2));
+  geo.setAttribute('color', new THREE.BufferAttribute(tile.colors, 3));
+  geo.setIndex(new THREE.BufferAttribute(tile.indices, 1));
   geo.computeBoundingSphere(); // for frustum culling
-
   return new THREE.Mesh(geo, material);
 }
 
-async function fetchTile(dim, cx, cz) {
-  const res = await fetch(dataURL(`tile/${dim}/${cx}/${cz}.json`));
-  if (!res.ok) throw new Error(`tile ${cx},${cz}: HTTP ${res.status}`);
-  return res.json(); // gzip on the wire is transparent to fetch()
+// Tiles are fetched and parsed on a small pool of workers, off the thread
+// that draws: parsing a few hundred KB of JSON per tile here was what made
+// the map stutter, and the controls with it, while tiles streamed in.
+const TILE_WORKERS = Math.max(2, Math.min(4, (navigator.hardwareConcurrency || 4) - 1));
+const tileWorkers = [];
+const tileWaiters = new Map();
+let tileJob = 0;
+for (let i = 0; i < TILE_WORKERS; i++) {
+  const w = new Worker(new URL('./tileworker.js', import.meta.url));
+  w.onmessage = (e) => {
+    const { id } = e.data;
+    const waiter = tileWaiters.get(id);
+    if (!waiter) return;
+    tileWaiters.delete(id);
+    if (e.data.ok) waiter.resolve(e.data.tile);
+    else waiter.reject(new Error(e.data.error));
+  };
+  tileWorkers.push(w);
+}
+
+function fetchTile(dim, cx, cz) {
+  const id = ++tileJob;
+  const url = new URL(dataURL(`tile/${dim}/${cx}/${cz}.json`), location.href).href;
+  return new Promise((resolve, reject) => {
+    tileWaiters.set(id, { resolve, reject });
+    tileWorkers[id % tileWorkers.length].postMessage({ id, url });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -332,9 +359,22 @@ function focusChunk() {
 // Recompute the desired set around the focus chunk: queue loads for missing
 // coords, unload coords beyond the margin. Cheap (~O(radius^2 + resident)),
 // safe to call often.
+// How many chunks to keep around the focus: enough to fill the view at the
+// current zoom, up to LOAD_RADIUS. Zoomed in, a 41x41 ring of tiles is mostly
+// fog and costs as much to stream as the full view zoomed out; the fog moves
+// in with the ring so its edge is still never seen.
+let loadRadius = LOAD_RADIUS;
+function viewRadius() {
+  const dist = camera.position.distanceTo(controls.target);
+  return Math.max(8, Math.min(LOAD_RADIUS, Math.ceil((dist * 1.6) / 16) + 4));
+}
+
 function updateStreaming() {
   if (!streaming) return;
   const [fx, fz] = focusChunk();
+  loadRadius = viewRadius();
+  scene.fog.near = loadRadius * 16 * 0.55;
+  scene.fog.far = loadRadius * 16 * 0.95;
 
   // Unload: anything resident beyond LOAD_RADIUS + UNLOAD_MARGIN (Chebyshev).
   // In-flight fetches are left alone; their completion handler re-checks
@@ -342,15 +382,15 @@ function updateStreaming() {
   for (const [key, state] of tiles) {
     if (state === LOADING) continue;
     const [cx, cz] = key.split(',').map(Number);
-    if (Math.max(Math.abs(cx - fx), Math.abs(cz - fz)) > LOAD_RADIUS + UNLOAD_MARGIN) {
+    if (Math.max(Math.abs(cx - fx), Math.abs(cz - fz)) > loadRadius + UNLOAD_MARGIN) {
       unloadTile(key, state);
     }
   }
 
   // Load: every coord within LOAD_RADIUS not already tracked, nearest first.
   pendingQueue = [];
-  for (let dz = -LOAD_RADIUS; dz <= LOAD_RADIUS; dz++) {
-    for (let dx = -LOAD_RADIUS; dx <= LOAD_RADIUS; dx++) {
+  for (let dz = -loadRadius; dz <= loadRadius; dz++) {
+    for (let dx = -loadRadius; dx <= loadRadius; dx++) {
       const cx = fx + dx, cz = fz + dz;
       if (!tiles.has(tileKey(cx, cz))) {
         pendingQueue.push([cx, cz, dx * dx + dz * dz]);
@@ -399,7 +439,7 @@ async function loadTile(cx, cz, key) {
   let mesh = null; // null = loaded-empty (no geometry, or fetch failed)
   try {
     const tile = await fetchTile(streaming.dim, cx, cz);
-    if (tile.indices && tile.indices.length > 0) {
+    if (!tile.empty) {
       mesh = buildTileMesh(tile, streaming.material);
     }
   } catch (err) {
@@ -413,7 +453,7 @@ async function loadTile(cx, cz, key) {
   // The focus may have moved while this fetch was in flight; drop results
   // that are already out of keep-range instead of parking them resident.
   const [fx, fz] = focusChunk();
-  if (Math.max(Math.abs(cx - fx), Math.abs(cz - fz)) > LOAD_RADIUS + UNLOAD_MARGIN) {
+  if (Math.max(Math.abs(cx - fx), Math.abs(cz - fz)) > loadRadius + UNLOAD_MARGIN) {
     if (mesh) mesh.geometry.dispose();
     tiles.delete(key);
   } else {
@@ -441,7 +481,7 @@ async function refreshTile(cx, cz, key, expected) {
   let mesh = null; // null = the chunk is now empty (all air), a valid result
   try {
     const tile = await fetchTile(streaming.dim, cx, cz);
-    if (tile.indices && tile.indices.length > 0) {
+    if (!tile.empty) {
       mesh = buildTileMesh(tile, streaming.material);
     }
   } catch (err) {

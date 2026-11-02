@@ -27,7 +27,7 @@ import (
 	"github.com/tachyne/tachyne-world/worldread"
 )
 
-//go:embed web/index.html web/app.js web/vendor
+//go:embed web/index.html web/app.js web/tileworker.js web/vendor
 var webFS embed.FS
 
 func main() {
